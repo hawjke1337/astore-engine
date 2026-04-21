@@ -76,6 +76,20 @@ def uploaded_file(filename):
 
 def notify_clients(data_type="general"):
     socketio.emit('db_updated', {'type': data_type})
+
+
+def get_authenticated_user_id():
+    return session.get('auth_user_id') or session.get('user_id')
+
+
+def get_shared_data_user_id():
+    db = get_db()
+    row = db.execute("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1").fetchone()
+    if row:
+        return row['id']
+
+    row = db.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+    return row['id'] if row else None
 # ---------- Глобальные структуры ----------
 background_tasks = {}      # session_id -> thread
 user_clients = {}          # session_id -> (thread, client, user_id)
@@ -115,19 +129,6 @@ def login_required(f):
     def wrapped(*args, **kwargs):
         if 'user_id' not in session:
             return redirect(url_for('login_page'))
-            
-        # --- НОВАЯ СТРОГАЯ ПРОВЕРКА СЕССИИ ---
-        user_id = session['user_id']
-        db = get_db()
-        user = db.execute("SELECT session_token FROM users WHERE id = ?", (user_id,)).fetchone()
-        
-        # Если в базе есть токен, а в текущем браузере он не совпадает — разлогиниваем
-        if user and 'session_token' in user.keys() and user['session_token']:
-            if session.get('session_token') != user['session_token']:
-                session.clear()
-                return redirect(url_for('login_page'))
-        # --------------------------------------
-        
         return f(*args, **kwargs)
     return wrapped
 
@@ -233,27 +234,7 @@ def bot_interaction_scheduler():
 # --- Маршруты для Товаров ---
 @app.before_request
 def check_session_token():
-    # Пропускаем проверку для страниц логина и логаута
-    if request.endpoint in ['login_page', 'static', 'logout']:
-        return
-        
-    if 'user_id' in session:
-        try:
-            db = get_db()
-            user = db.execute("SELECT session_token FROM users WHERE id = ?", (session['user_id'],)).fetchone()
-            
-            if user and 'session_token' in user.keys() and user['session_token']:
-                if session.get('session_token') != user['session_token']:
-                    session.clear()
-                    
-                    # Если запрос пришел от фонового скрипта (fetch/ajax)
-                    if request.path.startswith('/api/'):
-                        return jsonify({'error': 'Сеанс завершен'}), 401
-                        
-                    # Если это обычная загрузка страницы
-                    return redirect(url_for('login_page'))
-        except Exception:
-            pass
+    return
 
 import google.generativeai as genai
 import json
@@ -2476,6 +2457,11 @@ def stop_message_listener(session_id):
 def serve_logo():
     # Отдаем файл logo.svg прямо из корня проекта
     return send_from_directory(os.getcwd(), 'logo.svg')
+
+
+@app.route('/logo-transparent.png')
+def serve_logo_transparent():
+    return send_from_directory(os.getcwd(), 'logo-transparent.png')
 
 # Было: @app.route('/api/excel/configs/chat/<int:chat_id>', methods=['DELETE'])
 @app.route('/api/excel/configs/chat/<chat_id>', methods=['DELETE'])

@@ -1097,7 +1097,8 @@ function filterProductsByFolder(folderId, folderName) {
 }
 
 
-        async function apiFetch(url, options = {}) {
+        async function apiFetch(url, options = {}, retryCount = 1) {
+            const originalUrl = url;
             // --- ИСПРАВЛЕНИЕ: Автоматически сбрасываем кэш при любом изменении (POST, PUT, DELETE) ---
             if (options.method && options.method.toUpperCase() !== 'GET') {
                 window.apiCache = {}; 
@@ -1106,19 +1107,30 @@ function filterProductsByFolder(folderId, folderName) {
                 const separator = url.includes('?') ? '&' : '?';
                 url += `${separator}_t=${new Date().getTime()}`;
             }
-            
+
             options.cache = 'no-store'; // Жесткий запрет кэша
             // ---------------------------------------------------------------------------------------
 
             const resp = await fetch(url, options);
             if (!resp.ok) {
+                if ([502, 503, 504].includes(resp.status) && retryCount > 0) {
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                    return apiFetch(originalUrl, options, retryCount - 1);
+                }
+
                 const text = await resp.text();
                 let errorText = 'Неизвестная ошибка сервера';
+
+                if ([502, 503, 504].includes(resp.status)) {
+                    errorText = 'Сайт сейчас обновляется. Попробуйте еще раз через несколько секунд.';
+                } else {
                 try {
                     errorText = JSON.parse(text).error || text;
                 } catch (e) {
                     errorText = text;
                 }
+                }
+
                 alert('Внимание: ' + errorText);
                 throw new Error(errorText);
             }

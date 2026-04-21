@@ -1,0 +1,15 @@
+[Unit]
+Description=Astore Engine
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/astore-engine/app
+EnvironmentFile=/opt/astore-engine/app/.env
+ExecStart=/opt/astore-engine/app/.venv/bin/python /opt/astore-engine/app/store.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

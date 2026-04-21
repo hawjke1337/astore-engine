@@ -12,6 +12,10 @@ __pycache__/
 sessions/
 uploads/
 excel_files/
+photos/
+store.html
+store.txt
+*.pyproj
 instance/
 *.log
 certs/

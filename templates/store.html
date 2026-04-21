@@ -86,11 +86,11 @@
     position: sticky; top: 0; z-index: 100;
 }
 .top-menu {
-    padding: 18px 24px 0;
+    padding: 14px 24px;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     max-width: 1400px;
     margin: 0 auto;
     width: 100%;
@@ -120,19 +120,19 @@
     display: flex;
     list-style: none;
     gap: 10px;
-    flex-wrap: wrap;
-    width: 100%;
-    border-top: 1px solid rgba(255,255,255,0.08);
-    padding-top: 10px;
+    flex-wrap: nowrap;
+    align-items: center;
+    margin-left: auto;
 }
         .menu-items li {
-    padding: 14px 12px 13px;
+    padding: 10px 10px 9px;
     font-weight: 500;
     color: #b9c7db;
     cursor: pointer;
     border-bottom: 3px solid transparent;
     transition: 0.2s;
     white-space: nowrap;
+    font-size: 14px;
 }
         .menu-items li.active { color: #ffffff; border-bottom-color: #9ec5ff; }
         .menu-items li:not(.active):hover { color: #ffffff; background: rgba(255,255,255,0.06); border-radius: 6px; }

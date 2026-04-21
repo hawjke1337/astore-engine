@@ -1,0 +1,9 @@
+Flask
+Flask-SocketIO
+Werkzeug
+Telethon
+qrcode
+pandas
+pdfplumber
+openpyxl
+python-socketio

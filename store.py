@@ -34,7 +34,10 @@ import math
 import pandas as pd
 import tempfile
 import pdfplumber
+from dotenv import load_dotenv
 sqlite3.register_adapter(datetime, lambda d: d.strftime("%Y-%m-%d %H:%M:%S"))
+
+load_dotenv()
 
 
 

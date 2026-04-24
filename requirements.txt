@@ -8,3 +8,6 @@ pdfplumber
 openpyxl
 python-socketio
 python-dotenv
+google-generativeai
+google-genai
+requests

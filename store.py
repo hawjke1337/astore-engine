@@ -34,10 +34,19 @@ import math
 import pandas as pd
 import tempfile
 import pdfplumber
-from dotenv import load_dotenv
+import re
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
 sqlite3.register_adapter(datetime, lambda d: d.strftime("%Y-%m-%d %H:%M:%S"))
 
-load_dotenv()
+try:
+    from google import genai as google_genai_sdk
+    from google.genai import types as google_genai_types
+except Exception:
+    google_genai_sdk = None
+    google_genai_types = None
 
 
 
@@ -49,47 +58,59 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE_PATH = os.getenv('DATABASE_PATH', os.path.join(BASE_DIR, 'app.db'))
-SECRET_KEY = os.getenv('SECRET_KEY', 'change-me-in-production')
-FLASK_HOST = os.getenv('FLASK_HOST', '0.0.0.0')
-FLASK_PORT = int(os.getenv('FLASK_PORT', '5000'))
-FLASK_DEBUG = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
+
+if load_dotenv:
+    for env_name in (".env", ".env.local"):
+        env_path = os.path.join(BASE_DIR, env_name)
+        if os.path.exists(env_path):
+            load_dotenv(env_path, override=False)
 
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
-app.config['DATABASE'] = DATABASE_PATH
+app.secret_key = 'supersecretkey_for_demo'
+app.config['DATABASE'] = os.path.join(BASE_DIR, 'app.db')
 app.json.ensure_ascii = False
 # ПЕРЕНЕСТИ СЮДА (строки, которые сейчас перед шаблонами)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_timeout=120, ping_interval=25) 
+PRODUCT_SEARCH_CACHE = {}
+ACCESS_TREE_CACHE = {}
+
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 
 # Настройка папки для хранения фото
-UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', os.path.join(BASE_DIR, 'uploads'))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 # НОВЫЙ МАРШРУТ: Отдаем загруженные файлы по ссылке
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    response = send_from_directory(app.config['UPLOAD_FOLDER'], filename, max_age=31536000)
+    response.cache_control.public = True
+    response.cache_control.max_age = 31536000
+    return response
+
+def invalidate_product_search_cache(user_id=None):
+    if user_id is None:
+        PRODUCT_SEARCH_CACHE.clear()
+        return
+    PRODUCT_SEARCH_CACHE.pop(int(user_id), None)
+
+def invalidate_access_tree_cache(user_id=None):
+    if user_id is None:
+        ACCESS_TREE_CACHE.clear()
+        return
+    ACCESS_TREE_CACHE.pop(int(user_id), None)
 
 def notify_clients(data_type="general"):
+    invalidate_product_search_cache()
+    invalidate_access_tree_cache()
     socketio.emit('db_updated', {'type': data_type})
-
-
-def get_authenticated_user_id():
-    return session.get('auth_user_id') or session.get('user_id')
-
-
-def get_shared_data_user_id():
-    db = get_db()
-    row = db.execute("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1").fetchone()
-    if row:
-        return row['id']
-
-    row = db.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
-    return row['id'] if row else None
 # ---------- Глобальные структуры ----------
 background_tasks = {}      # session_id -> thread
 user_clients = {}          # session_id -> (thread, client, user_id)
@@ -124,11 +145,39 @@ def custom_exception_handler(loop, context):
 import functools
 from flask import session, redirect, url_for
 from datetime import datetime, timedelta, timezone
+
+def build_expired_session_response():
+    session.clear()
+    if request.path.startswith('/api/'):
+        return jsonify({'error': 'Сеанс завершен'}), 401
+    return redirect(url_for('login_page'))
+
+def get_session_user_record():
+    if 'user_id' not in session:
+        return None
+    db = get_db()
+    return db.execute(
+        "SELECT id, role, session_token FROM users WHERE id = ?",
+        (session['user_id'],)
+    ).fetchone()
+
+def has_invalid_session_token(user):
+    if not user:
+        return True
+    if 'session_token' in user.keys() and user['session_token']:
+        return session.get('session_token') != user['session_token']
+    return False
+
 def login_required(f):
     @functools.wraps(f)
     def wrapped(*args, **kwargs):
         if 'user_id' not in session:
             return redirect(url_for('login_page'))
+            
+        user = get_session_user_record()
+        if has_invalid_session_token(user):
+            return build_expired_session_response()
+        
         return f(*args, **kwargs)
     return wrapped
 
@@ -156,6 +205,81 @@ def get_db():
         
         db.row_factory = sqlite3.Row
     return db
+
+def get_table_sql(db, table_name):
+    row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return (row[0] if row else '') or ''
+
+
+def table_exists(db, table_name):
+    return bool(get_table_sql(db, table_name))
+
+
+def get_next_product_sort_index(db, user_id):
+    row = db.execute(
+        "SELECT COALESCE(MAX(sort_index), 0) + 1 FROM products WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    return int(row[0] if row and row[0] is not None else 1)
+
+
+def build_product_sort_index(base_index, product_name=None):
+    try:
+        normalized_base = int(base_index)
+    except (TypeError, ValueError):
+        return None
+
+    raw_name = str(product_name or '').lower()
+    if 'esim' in raw_name and '1sim' not in raw_name and '2sim' not in raw_name:
+        variant_rank = 0
+    elif '1sim' in raw_name or 'sim+esim' in raw_name:
+        variant_rank = 1
+    elif '2sim' in raw_name:
+        variant_rank = 2
+    else:
+        variant_rank = 3
+    return normalized_base * 10 + variant_rank
+
+
+def update_product_sort_index(db, user_id, product_id, sort_index):
+    if sort_index is None:
+        return
+    try:
+        normalized_sort_index = int(sort_index)
+    except (TypeError, ValueError):
+        return
+    db.execute(
+        "UPDATE products SET sort_index = ? WHERE id = ? AND user_id = ?",
+        (normalized_sort_index, product_id, user_id),
+    )
+
+
+def maybe_sync_product_sort_from_message(db, user_id, product_id, message_id, line_index):
+    if line_index is None or int(line_index) < 0:
+        return
+    product = db.execute(
+        "SELECT name FROM products WHERE id = ? AND user_id = ?",
+        (product_id, user_id),
+    ).fetchone()
+    msg = db.execute(
+        "SELECT chat_id, type FROM messages WHERE id = ? AND user_id = ?",
+        (message_id, user_id),
+    ).fetchone()
+    if not msg or not product:
+        return
+
+    msg_type = str(msg['type'] or '')
+    chat_id = str(msg['chat_id'] or '')
+    if msg_type.startswith('excel') or chat_id.startswith('api_src_'):
+        update_product_sort_index(
+            db,
+            user_id,
+            product_id,
+            build_product_sort_index(int(line_index), product['name']),
+        )
 
 def bot_interaction_scheduler():
     """Фоновый поток для автоматической отправки команд ботам по расписанию"""
@@ -234,86 +358,1684 @@ def bot_interaction_scheduler():
 # --- Маршруты для Товаров ---
 @app.before_request
 def check_session_token():
-    return
+    # Пропускаем проверку для страниц логина и логаута
+    if request.endpoint in ['login_page', 'static', 'logout']:
+        return
+        
+    if 'user_id' in session:
+        try:
+            user = get_session_user_record()
+            if has_invalid_session_token(user):
+                return build_expired_session_response()
+        except Exception:
+            pass
 
 import google.generativeai as genai
 import json
 from flask import request, jsonify
 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-@app.route('/api/autofill', methods=['POST'])
-def autofill():
-    if not GEMINI_API_KEY:
-        return jsonify({"error": "GEMINI_API_KEY is not configured"}), 500
+AUTOFILL_RESPONSE_KEYS = [
+    "brand",
+    "country_sim",
+    "weight",
+    "color",
+    "storage",
+    "ram",
+    "display",
+    "processor",
+    "camera",
+    "front_camera",
+    "video",
+    "connectivity",
+    "battery",
+    "os",
+    "biometrics",
+    "charging",
+    "warranty",
+    "model_no",
+    "description",
+]
 
-    data = request.json
-    product_name = data.get('name', '')
+AUTOFILL_REQUIRED_NOTE = "Версия без RuStore"
+AUTOFILL_APPLE_NOTE = "Оригинальная продукция Apple"
+AUTOFILL_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+AUTOFILL_SUPPLEMENT_MIN_SCORE = 1.2
+DEFAULT_IPHONE_OS_VERSION = "iOS 18"
+STORE_WARRANTY_DEFAULT = "Гарантия от магазина 1 год"
+GENERIC_BRAND_LABELS = {
+    "card",
+    "cm",
+    "аксессуары",
+    "аксессуары для",
+    "гаджеты",
+    "гейминг",
+    "геймпады для",
+    "детские умные часы",
+    "игры и подписки для",
+    "наушники и колонки",
+    "портативные игровые приставки",
+    "планшеты",
+    "продукция dyson",
+    "смартфоны",
+    "умные часы",
+    "умные часы и фитнес-браслеты",
+}
+BRAND_COUNTRY_FALLBACKS = {
+    "A4TECH": "Китай",
+    "Anker": "Китай",
+    "Aukey": "Китай",
+    "Awei": "Китай",
+    "Asus": "Тайвань",
+    "Baseus": "Китай",
+    "Belkin": "США",
+    "Borofone": "Китай",
+    "Canyon": "Китай",
+    "Dyson": "Малайзия",
+    "Elago": "Южная Корея",
+    "ELARI": "Китай",
+    "Google": "Вьетнам",
+    "HOCO": "Китай",
+    "Honor": "Китай",
+    "HP": "Китай",
+    "Huawei": "Китай",
+    "Inkax": "Китай",
+    "Kodak": "Китай",
+    "Lenovo": "Китай",
+    "Ldnio": "Китай",
+    "Logitech": "Китай",
+    "Native Union": "Гонконг",
+    "Nintendo": "Япония",
+    "Nothing": "Китай",
+    "Nubia": "Китай",
+    "OnePlus": "Китай",
+    "Philips": "Нидерланды",
+    "PlayStation": "Япония",
+    "PowerA": "США",
+    "reMarkable": "Китай",
+    "Ritmix": "Китай",
+    "Samsung": "Вьетнам",
+    "SanDisk": "США",
+    "Satechi": "США",
+    "Sony": "Китай",
+    "Tecno": "Китай",
+    "Transcend": "Тайвань",
+    "UAG": "США",
+    "Valve": "США",
+    "WIWU": "Китай",
+    "Whoop": "США",
+    "Xbox": "США",
+    "Xiaomi": "Китай",
+    "Яндекс": "Россия",
+}
+FOLDER_NAME_TRAILING_FILLER_RE = re.compile(r"\s+для\s*$", re.IGNORECASE)
+BRAND_KEYWORDS = (
+    ("Anker", ("anker",)),
+    ("Aukey", ("aukey",)),
+    ("Awei", ("awei",)),
+    ("Asus", ("asus", "rog phone", "zenfone")),
+    ("Samsung", ("galaxy", "samsung", "z fold", "z flip")),
+    ("Xiaomi", ("xiaomi", "redmi", "poco")),
+    ("Google", ("pixel", "google")),
+    ("Honor", ("honor",)),
+    ("Realme", ("realme",)),
+    ("OnePlus", ("oneplus", "one plus")),
+    ("Nothing", ("nothing phone", "cmf phone", "cmf by nothing")),
+    ("Oppo", ("oppo",)),
+    ("Vivo", ("vivo",)),
+    ("Huawei", ("huawei",)),
+    ("Яндекс", ("яндекс", "yandex")),
+    ("Motorola", ("motorola", " moto ")),
+    ("Sony", ("sony", "xperia")),
+    ("Infinix", ("infinix",)),
+    ("Tecno", ("tecno",)),
+    ("Valve", ("steam deck", "valve")),
+    ("Lenovo", ("lenovo legion", "legion go")),
+    ("Nintendo", ("nintendo switch", "switch oled", "switch lite")),
+    ("PlayStation", ("playstation", " ps5", " ps4")),
+    ("Xbox", ("xbox",)),
+    ("PowerA", ("powera",)),
+    ("Dyson", ("dyson",)),
+    ("SanDisk", ("sandisk",)),
+    ("Kingston", ("kingston",)),
+    ("Philips", ("philips",)),
+    ("HP", ("hp ", "hp elite", "hp pro")),
+    ("Belkin", ("belkin",)),
+    ("Transcend", ("transcend",)),
+    ("Baseus", ("baseus",)),
+    ("Borofone", ("borofone",)),
+    ("uBear", ("ubear",)),
+    ("UNIQ", ("uniq",)),
+    ("Breaking", ("breaking",)),
+    ("Remax", ("remax",)),
+    ("Magssory", ("magssory",)),
+    ("Netac", ("netac",)),
+    ("OltraMax", ("oltramax",)),
+    ("TV-COM", ("tv-com",)),
+    ("ADATA", ("adata",)),
+    ("Silicon Power", ("silicon power",)),
+    ("WIWU", ("wiwu",)),
+    ("UAG", ("uag", "urban armor gear")),
+    ("Elago", ("elago",)),
+    ("Satechi", ("satechi",)),
+    ("Native Union", ("native union",)),
+    ("Ldnio", ("ldnio",)),
+    ("Inkax", ("inkax",)),
+    ("Anker", ("anker",)),
+    ("Awei", ("awei",)),
+    ("Aukey", ("aukey",)),
+    ("Prime Line", ("prime line",)),
+    ("Pitaka", ("pitaka",)),
+    ("Deppa", ("deppa",)),
+    ("Defender", ("defender",)),
+    ("DEXP", ("dexp",)),
+    ("Oxion", ("oxion",)),
+    ("PNY", ("pny",)),
+    ("HOCO", ("hoco",)),
+    ("Kodak", ("kodak",)),
+    ("JBL", ("jbl",)),
+    ("Logitech", ("logitech",)),
+    ("Canyon", ("canyon",)),
+    ("Ritmix", ("ritmix",)),
+    ("A4TECH", ("a4tech",)),
+    ("reMarkable", ("remarkable",)),
+    ("Whoop", ("whoop",)),
+    ("Nubia", ("nubia", "redmagic")),
+)
+ACCESSORY_COMPATIBILITY_MARKERS = (
+    "airpods",
+    "apple watch",
+    "iphone",
+    "ipad",
+    "для apple",
+    "for apple",
+    "для samsung",
+    "for samsung",
+    "mag safe",
+    "magsafe",
+)
+DESCRIPTION_TEMPLATE_MARKERS = (
+    "это понятная и аккуратно оформленная карточка для магазина",
+    "карточка, собранная из актуального каталога cmstore",
+    "товар оформлен для каталога магазина",
+    "ключевые характеристики:",
+    "исполнение:",
+    "читать полностью",
+    "<div",
+)
+APPLE_DESCRIPTION_NOTE_KINDS = {"smartphone", "tablet", "laptop", "watch"}
+ANDROID_BRANDS = {
+    "Asus",
+    "Google",
+    "Honor",
+    "Huawei",
+    "Motorola",
+    "Nothing",
+    "OnePlus",
+    "Oppo",
+    "Realme",
+    "Samsung",
+    "Sony",
+    "Tecno",
+    "Vivo",
+    "Xiaomi",
+}
+IPHONE_MODEL_WEIGHT_MAP = {
+    "11": "0.194",
+    "12": "0.164",
+    "13 Mini": "0.141",
+    "13": "0.174",
+    "14": "0.172",
+    "14 Plus": "0.203",
+    "15": "0.171",
+    "15 Plus": "0.201",
+    "15 Pro": "0.187",
+    "15 Pro Max": "0.221",
+    "16e": "0.167",
+    "16": "0.170",
+    "16 Plus": "0.199",
+    "16 Pro": "0.199",
+    "16 Pro Max": "0.227",
+    "17e": "0.180",
+    "17": "0.190",
+    "17 Air": "0.170",
+    "17 Pro": "0.200",
+    "17 Pro Max": "0.240",
+    "SE 2022": "0.144",
+}
+IPHONE_MODEL_PATTERNS = [
+    (r"^17\s+pro\s+max\b", "17 Pro Max"),
+    (r"^17\s+pro\b", "17 Pro"),
+    (r"^17\s+air\b", "17 Air"),
+    (r"^17e\b", "17e"),
+    (r"^17\b", "17"),
+    (r"^16\s+pro\s+max\b", "16 Pro Max"),
+    (r"^16\s+pro\b", "16 Pro"),
+    (r"^16\s+plus\b", "16 Plus"),
+    (r"^16e\b", "16e"),
+    (r"^16\b", "16"),
+    (r"^15\s+pro\s+max\b", "15 Pro Max"),
+    (r"^15\s+pro\b", "15 Pro"),
+    (r"^15\s+plus\b", "15 Plus"),
+    (r"^15\b", "15"),
+    (r"^14\s+plus\b", "14 Plus"),
+    (r"^14\b", "14"),
+    (r"^13\s+mini\b", "13 Mini"),
+    (r"^13\b", "13"),
+    (r"^12\b", "12"),
+    (r"^11\b", "11"),
+    (r"^se(?:\s+2022)?\b", "SE 2022"),
+]
+APPLE_PART_NUMBER_PATTERN = re.compile(r"\bM(?=[A-Z0-9]{4}(?:/[A-Z])?\b)(?=[A-Z0-9]*\d)[A-Z0-9]{4}(?:/[A-Z])?\b", re.IGNORECASE)
+APPLE_FAMILY_PREFIX_PATTERN = re.compile(
+    r"^(macbook|ipad|airpods|apple watch|imac|mac mini|mac studio|vision pro)\b",
+    re.IGNORECASE,
+)
+SIM_INLINE_VARIANT_PATTERN = re.compile(r"\s*\((?:[^)]*\b(?:e\s*sim|sim)\b[^)]*)\)", re.IGNORECASE)
+SIM_DESCRIPTION_PATTERN = re.compile(
+    r"(?:\b(?:e\s*sim|1\s*sim|2\s*sim|sim\+e\s*sim)\b|sim-карт|sim карт|физическ\w+\s+sim|слот\w*\s+для\s+sim)",
+    re.IGNORECASE,
+)
+AUTOFILL_SPEC_KEYS = [
+    "display",
+    "processor",
+    "camera",
+    "front_camera",
+    "video",
+    "connectivity",
+    "battery",
+    "os",
+    "biometrics",
+    "charging",
+]
+AUTOFILL_CACHE_MAX_AGE_DAYS = 30
+AI_REPAIR_JOB_BATCH_SIZE = 10
+VARIANT_FOLDER_NAMES = {"esim", "sim+esim", "2sim"}
+STORAGE_FOLDER_NAME_RE = re.compile(r"^\d+(?:\.\d+)?(?:gb|tb)$", re.IGNORECASE)
+IPHONE_CATALOG_PATH = ("Электроника", "Смартфоны", "iPhone")
+DATA_CABLES_CATALOG_PATH = ("Электроника", "Аксессуары", "Зарядные устройства", "Дата-кабели")
+NETWORK_CHARGERS_CATALOG_PATH = ("Электроника", "Аксессуары", "Зарядные устройства", "Сетевые зарядные устройства")
+WATCH_CHARGERS_CATALOG_PATH = (
+    "Электроника",
+    "Аксессуары",
+    "Зарядные устройства",
+    "Зарядные устройства для умных часов и фитнес-браслетов",
+)
+YANDEX_STATION_CATALOG_PATH = ("Электроника", "Наушники и колонки", "Умные колонки", "Яндекс станция")
+JBL_SPEAKER_CATALOG_PATH = (
+    "Электроника",
+    "Наушники и колонки",
+    "Портативные колонки и акустические системы",
+    "JBL",
+)
+PLAYSTATION_SUBSCRIPTIONS_CATALOG_PATH = ("Электроника", "Гейминг", "PlayStation", "Игры и подписки для")
+XBOX_SUBSCRIPTIONS_CATALOG_PATH = ("Электроника", "Гейминг", "Xbox", "Игры и подписки для")
+STEAM_DECK_CATALOG_PATH = ("Электроника", "Гейминг", "Портативные игровые приставки", "Steam Deck")
+CONSTRUCTORS_CATALOG_PATH = ("Электроника", "Гаджеты", "Хобби и отдых", "Конструкторы")
+COMPUTER_ACCESSORIES_CATALOG_PATH = ("Электроника", "Аксессуары", "Аксессуары для компьютера")
+AIRPODS_CATALOG_PATH = ("Электроника", "Наушники и колонки", "Наушники", "AirPods")
+IPHONE_MODEL_FOLDER_PATTERNS = (
+    (r"\b17\s+pro\s+max\b", "iPhone 17 Pro Max"),
+    (r"\b17\s+pro\b", "iPhone 17 Pro"),
+    (r"\b17\s+air\b", "iPhone 17 Air"),
+    (r"\b17\s*[eе]\b", "iPhone 17e"),
+    (r"\b17\b", "iPhone 17"),
+    (r"\b16\s+pro\s+max\b", "iPhone 16 Pro Max"),
+    (r"\b16\s+pro\b", "iPhone 16 Pro"),
+    (r"\b16\s+plus\b", "iPhone 16 Plus"),
+    (r"\b16\s*[eе]\b", "iPhone 16e"),
+    (r"\b16\b", "iPhone 16"),
+    (r"\b15\s+pro\s+max\b", "iPhone 15 Pro Max"),
+    (r"\b15\s+pro\b", "iPhone 15 Pro"),
+    (r"\b15\s+plus\b", "iPhone 15 Plus"),
+    (r"\b15\b", "iPhone 15"),
+    (r"\b14\s+pro\s+max\b", "iPhone 14 Pro Max"),
+    (r"\b14\s+pro\b", "iPhone 14 Pro"),
+    (r"\b14\s+plus\b", "iPhone 14 Plus"),
+    (r"\b14\b", "iPhone 14"),
+    (r"\b13\s+mini\b", "iPhone 13 Mini"),
+    (r"\b13\b", "iPhone 13"),
+    (r"\b12\b", "iPhone 12"),
+    (r"\b11\b", "iPhone 11"),
+    (r"\bse(?:\s+2022)?\b", "iPhone SE 2022"),
+)
+IPHONE_17_PRO_ESIM_FLAGS = {"🇧🇭", "🇨🇦", "🇬🇺", "🇯🇵", "🇰🇼", "🇲🇽", "🇴🇲", "🇶🇦", "🇸🇦", "🇦🇪", "🇺🇸", "🇻🇮"}
+IPHONE_17_PRO_GLOBAL_FLAGS = {"🇭🇰", "🇫🇷", "🇩🇪", "🇬🇧", "🇮🇹", "🇪🇸", "🇸🇪", "🇳🇱", "🇵🇱", "🇦🇺", "🇳🇿", "🇰🇷", "🇸🇬", "🇪🇺"}
+IPHONE_17_PRO_2SIM_FLAGS = {"🇨🇳"}
+IPHONE_14_16_ESIM_FLAGS = {"🇺🇸"}
+IPHONE_14_16_2SIM_FLAGS = {"🇭🇰", "🇨🇳"}
+BRAND_FALLBACK_TOKEN_STOPWORDS = {
+    "cm",
+    "wi-fi",
+    "usb",
+    "vga",
+    "hdmi",
+    "displayport",
+    "type-c",
+    "lightning",
+    "digital",
+    "silicone",
+    "universal",
+    "mini",
+}
+ACCESSORY_COUNTRY_FALLBACK_MARKERS = (
+    "заряд",
+    "charger",
+    "адаптер",
+    "кабель",
+    "cable",
+    "чех",
+    "case",
+    "cover",
+    "держатель",
+    "airpods",
+    "науш",
+    "гарнитур",
+    "колонк",
+    "speaker",
+    "power bank",
+    "powerbank",
+    "флеш",
+    "карта памяти",
+    "ssd",
+    "airtag",
+    "hub",
+    "dock",
+    "док-станц",
+    "ремеш",
+    "strap",
+)
+BRAND_FALLBACK_PREFIX_RE = re.compile(
+    r"^(?:автомобильное зарядное устройство|сетевое зарядное устройство|беспроводное зарядное устройство|"
+    r"автомобильный держатель(?: магнитный)?|адаптер-разветвитель для компьютера|адаптер-переходник|"
+    r"внешний аккумулятор|дата-кабель|аудиокабель|кабель|чехол(?:-книжка)?|usb[- ]флешка|usb[- ]фонарик|"
+    r"детские умные часы|графический планшет|мышь беспроводная|стилус|ремешок на запястье для смартфона|"
+    r"батарейка|патч-корд|док-станция|кардхолдер)\s+",
+    re.IGNORECASE,
+)
 
-    if not product_name:
-        return jsonify({"error": "No product name"}), 400
 
-    prompt = f"""
-Ты - старший эксперт по заполнению карточек товаров для интернет-магазина.
-В магазин поступают самые разные товары: смартфоны, ноутбуки, планшеты, наушники, аксессуары.
-Твоя задача: проанализировать название: "{product_name}" и максимально точно заполнить характеристики.
+def brand_marker_in_text(text, marker):
+    haystack = str(text or "").lower()
+    needle = str(marker or "").lower()
+    if not haystack or not needle:
+        return False
+    if re.fullmatch(r"[a-z0-9]+", needle):
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", haystack))
+    return needle in haystack
 
-ВАЖНОЕ УСЛОВИЕ: ПЕРЕД ЗАПОЛНЕНИЕМ ТЫ ОБЯЗАН ИСПОЛЬЗОВАТЬ ПОИСК В ИНТЕРНЕТЕ для проверки спецификаций устройства. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ придумывать, генерировать случайные цифры или угадывать данные (особенно вес, артикулы, камеры и батарею).
 
-ОБЩИЕ ПРАВИЛА:
+def detect_brand_fallback_candidate(product_name):
+    original = str(product_name or "").strip()
+    normalized = BRAND_FALLBACK_PREFIX_RE.sub("", original, count=1).strip()
+    if not normalized:
+        normalized = original
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9+\-]{1,}", normalized):
+        lowered = token.lower()
+        if lowered in BRAND_FALLBACK_TOKEN_STOPWORDS:
+            continue
+        return token
+    return ""
 
-Идентификация Apple: Если в названии есть "13", "14 Pro", "15", "16 Pro Max", "17 Pro" и т.д. без бренда — это "Apple", модель "iPhone [номер]". AirPods, MacBook, iPad - тоже Apple.
 
-Идентификация Samsung: "S23", "S24", "A54", "Fold" — бренд "Samsung", модель "Galaxy [название]".
+def detect_brand_from_name(product_name):
+    name = str(product_name or "").lower()
+    if APPLE_PART_NUMBER_PATTERN.search(str(product_name or "")):
+        return "Apple"
+    for brand, markers in BRAND_KEYWORDS:
+        if brand == "Apple":
+            continue
+        if any(brand_marker_in_text(name, marker) for marker in markers) and any(marker in name for marker in ACCESSORY_COMPATIBILITY_MARKERS):
+            return brand
+    apple_markers = (
+        "iphone", "ipad", "macbook", "apple watch", "airpods", "imac", "mac mini", "vision pro"
+    )
+    if any(marker in name for marker in apple_markers):
+        return "Apple"
+    if looks_like_iphone_shorthand(product_name):
+        return "Apple"
+    for brand, markers in BRAND_KEYWORDS:
+        if any(brand_marker_in_text(name, marker) for marker in markers):
+            return brand
+    fallback_brand = sanitize_brand_value(detect_brand_fallback_candidate(product_name))
+    if fallback_brand:
+        return fallback_brand
+    return ""
 
-Пустые поля: Если для товара характеристика не применима (например, диагональ экрана для наушников) или в интернете не удалось найти точных, достоверных данных, ОБЯЗАТЕЛЬНО оставляй поле пустым: "". Никаких галлюцинаций.
 
-ИНСТРУКЦИЯ ПО ЗАПОЛНЕНИЮ КАЖДОГО ПОЛЯ (СТРОГИЕ ФОРМАТЫ):
+def normalize_folder_display_name(folder_name):
+    display_name = re.sub(r"\s+", " ", str(folder_name or "").strip())
+    if not display_name:
+        return ""
+    return FOLDER_NAME_TRAILING_FILLER_RE.sub("", display_name).strip()
 
-"brand": Производитель товара (например: Apple, Samsung, Xiaomi, Dyson).
 
-"country_sim": Тип SIM-карты (для смартфонов). Если в названии "(2Sim)", "Dual", "ZA/A", "CH/A" -> пиши "Dual SIM". Если "(eSim)", "LL/A" -> пиши "eSIM only". Если это версия для физической + виртуальной карты, пиши "nano-SIM + eSIM".
+def is_generic_brand_value(value):
+    normalized = re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+    if not normalized:
+        return True
+    return normalized in GENERIC_BRAND_LABELS or normalized.startswith("для ")
 
-"weight": Вес товара СТРОГО в килограммах. Формат: ноль или число, точка, три цифры. Например: "0.350", "1.200", "0.050". Опирайся только на реальные данные. Если не нашел — оставь "".
 
-"color": Цвет товара СТРОГО НА АНГЛИЙСКОМ ЯЗЫКЕ (как в оригинальном названии). Не переводи на русский (например: пиши "Black", "White", "Natural Titanium").
+def sanitize_brand_value(value):
+    brand = re.sub(r"\s+", " ", str(value or "").strip())
+    return "" if is_generic_brand_value(brand) else brand
 
-"storage": Объем встроенной памяти. СТРОГИЙ ФОРМАТ: Цифра + пробел + "GB" или "TB" (например: "256 GB", "512 GB", "1 TB"). ВАЖНО: Если в названии указан слитный формат (например, "12/256GB" или "8/128"), то БОЛЬШЕЕ число — это встроенная память (storage).
 
-"ram": Объем оперативной памяти. СТРОГИЙ ФОРМАТ: Цифра + пробел + "GB" (например: "8 GB", "16 GB"). ВАЖНО: 1) Если в названии указан формат "12/256GB", то МЕНЬШЕЕ число — это оперативная память (ram). 2) ИСКЛЮЧЕНИЕ: Apple не указывает RAM на официальном сайте. Для заполнения RAM у iPhone и iPad ОБЯЗАТЕЛЬНО ищи данные на авторитетных ресурсах (например, GSMArena) и заполняй это поле. Не оставляй его пустым для Apple.
+def infer_brand_country_fallback(brand):
+    return BRAND_COUNTRY_FALLBACKS.get(str(brand or "").strip(), "")
 
-"display": Характеристики экрана из официальных источников. СТРОГИЙ ФОРМАТ: [Диагональ]" [Тип матрицы] ([Особенности]), [Частота] Гц. Например: "6.9" OLED (Super Retina XDR), 120 Гц" или "6.8" Dynamic AMOLED 2X, 120 Гц".
 
-"processor": Точное название чипа. СТРОГИЙ ФОРМАТ: Производитель + Модель. Например: "Apple A19 Pro", "Qualcomm Snapdragon 8 Gen 3".
+def infer_accessory_country_fallback(product_name, brand=""):
+    brand_country = infer_brand_country_fallback(brand)
+    if brand_country:
+        return brand_country
+    normalized = str(product_name or "").lower()
+    if any(marker in normalized for marker in ACCESSORY_COUNTRY_FALLBACK_MARKERS):
+        return "Китай"
+    return ""
 
-"camera": Характеристики основного блока камер. СТРОГИЙ ФОРМАТ: Мегапиксели через плюс. Например: "48 МП + 48 МП + 12 МП" или "50 МП + 12 МП".
 
-"front_camera": Характеристики фронтальной камеры. Формат: "12 МП" или "12 МП + 3D сенсор".
+def infer_handheld_processor(product_name):
+    lower = str(product_name or "").lower()
+    if "z2 extreme" in lower:
+        return "AMD Ryzen Z2 Extreme"
+    if "z1 extreme" in lower:
+        return "AMD Ryzen Z1 Extreme"
+    if "z2 go" in lower:
+        return "AMD Ryzen Z2 Go"
+    return ""
 
-"video": Максимальное разрешение и частота кадров основной камеры. Например: "4K@60fps", "8K@30fps".
 
-"connectivity": Беспроводные сети и модули (через запятую). Например: "Wi-Fi 7, Bluetooth 5.3, 5G, NFC".
+def build_known_product_description(product_name, kind_title, highlights, extra_line=""):
+    safe_name = re.sub(r"\s+", " ", str(product_name or "").strip())
+    lines = [f"{safe_name} — {kind_title}, который хорошо подходит для повседневного использования."]
+    if extra_line:
+        lines.append(str(extra_line).strip().rstrip(".") + ".")
+    if highlights:
+        lines.append("Среди основных особенностей — " + ", ".join(highlights[:4]) + ".")
+    return "\n\n".join(lines)
 
-"battery": Автономность. СТРОГИЙ ФОРМАТ: "до [число] часов работы" (например: "до 22 часов работы", "до 29 часов работы"). Если измеряется только в мАч (как у Android), пиши "5000 мАч".
 
-"os": Операционная система "из коробки" для этой модели (например: "iOS 18", "Android 14").
+def supplement_autofill_payload_from_known_products(product_name, article="", payload=None):
+    next_payload = dict(payload or {})
+    raw_name = re.sub(r"\s+", " ", str(product_name or "").strip())
+    lower = raw_name.lower()
+    inferred_ram, inferred_storage = extract_ram_storage_from_name(raw_name)
 
-"biometrics": Способы разблокировки. Например: "Face ID" (для Apple) или "Сканер отпечатка пальца (в экране), Распознавание лица" (для Android).
+    def fill_if_missing(key, value):
+        value = str(value or "").strip()
+        if value and not str(next_payload.get(key) or "").strip():
+            next_payload[key] = value
 
-"charging": Поддерживаемые технологии зарядки. СТРОГИЙ ФОРМАТ: перечисление через запятую. Например: "MagSafe, быстрая зарядка, беспроводная зарядка".
+    def fill_many(values):
+        for key, value in (values or {}).items():
+            fill_if_missing(key, value)
 
-"warranty": По умолчанию всегда "12 месяцев".
+    if lower.startswith("игра для nintendo switch"):
+        game_title = re.sub(r"^игра\s+для\s+nintendo\s+switch(?:\s+2)?\s*", "", raw_name, flags=re.IGNORECASE).strip()
+        fill_many({
+            "brand": "Nintendo",
+            "country_sim": "Япония",
+            "display": "Зависит от консоли",
+            "processor": "Зависит от консоли",
+            "camera": "Не применяется",
+            "front_camera": "Не применяется",
+            "video": "Зависит от режима вывода консоли",
+            "connectivity": "Совместимость с Nintendo Switch",
+            "battery": "Зависит от консоли",
+            "os": "Nintendo Switch system software",
+            "biometrics": "Не применяется",
+            "charging": "Не применяется",
+            "warranty": STORE_WARRANTY_DEFAULT,
+        })
+        if game_title and not str(next_payload.get("description") or "").strip():
+            next_payload["description"] = build_known_product_description(
+                raw_name,
+                "игровое издание для Nintendo Switch",
+                [
+                    f"Платформа: {'Nintendo Switch 2' if 'switch 2' in lower else 'Nintendo Switch'}",
+                    f"Название: {game_title}",
+                    "Формат: игровой картридж или цифровая версия",
+                ],
+            )
+        return next_payload
 
-"model_no": АРТИКУЛ. Ищи реальный артикул.
+    if "nintendo switch" in lower and any(token in lower for token in ("joy-con", "controller", "powera", "wheel", "геймпад", "руль")):
+        accessory_brand = "PowerA" if "powera" in lower else "Nintendo"
+        fill_many({
+            "brand": accessory_brand,
+            "country_sim": infer_brand_country_fallback(accessory_brand),
+            "display": "Не применяется",
+            "processor": "Не применяется",
+            "camera": "Не применяется",
+            "front_camera": "Не применяется",
+            "video": "Не применяется",
+            "connectivity": "Совместимость с Nintendo Switch",
+            "battery": "Зависит от модели аксессуара",
+            "os": "Не применяется",
+            "biometrics": "Не применяется",
+            "charging": "Зависит от модели аксессуара",
+            "warranty": STORE_WARRANTY_DEFAULT,
+        })
+        if not str(next_payload.get("description") or "").strip():
+            next_payload["description"] = build_known_product_description(
+                raw_name,
+                "игровой аксессуар",
+                [
+                    f"Бренд: {accessory_brand}",
+                    f"Совместимость: {'Nintendo Switch 2' if 'switch 2' in lower else 'Nintendo Switch'}",
+                ],
+            )
+        return next_payload
 
-ДЛЯ IPHONE: найди в интернете корень оригинального артикула (Part Number) из 5 символов, начинающийся на "M" для этой конфигурации (например: MY0L4, MU793).
-ДЛЯ ОСТАЛЬНЫХ: пиши официальный заводской код, если нашел. Если не нашел - оставляй пустым "". Не выдумывай.
+    if "steam deck oled" in lower:
+        fill_many({
+            "brand": "Valve",
+            "country_sim": infer_brand_country_fallback("Valve"),
+            "weight": "0.640",
+            "storage": inferred_storage or "512 GB",
+            "ram": "16 GB",
+            "display": '7.4" OLED HDR, 90 Гц',
+            "processor": "AMD APU Zen 2 / RDNA 2",
+            "camera": "Нет",
+            "front_camera": "Нет",
+            "video": "1280x800, HDR, 90 Гц",
+            "connectivity": "Wi-Fi 6E, Bluetooth 5.3, USB-C",
+            "battery": "50 Wh",
+            "os": "SteamOS 3",
+            "biometrics": "Нет",
+            "charging": "USB-C PD 45 W",
+            "warranty": STORE_WARRANTY_DEFAULT,
+        })
+        if not str(next_payload.get("description") or "").strip():
+            next_payload["description"] = build_known_product_description(
+                raw_name,
+                "портативная игровая консоль",
+                ["Дисплей: 7.4\" OLED HDR", "ОЗУ: 16 GB", f"Память: {inferred_storage or '512 GB'}", "ОС: SteamOS 3"],
+            )
+        return next_payload
 
-"description": Напиши привлекательное продающее описание товара на 2-3 предложения, выделяя его главные преимущества для покупателя на основе его реальных характеристик.
+    if "steam deck" in lower:
+        fill_many({
+            "brand": "Valve",
+            "country_sim": infer_brand_country_fallback("Valve"),
+            "weight": "0.669",
+            "storage": inferred_storage or "256 GB",
+            "ram": "16 GB",
+            "display": '7.0" IPS, 60 Гц',
+            "processor": "AMD APU Zen 2 / RDNA 2",
+            "camera": "Нет",
+            "front_camera": "Нет",
+            "video": "1280x800, 60 Гц",
+            "connectivity": "Wi-Fi 5, Bluetooth 5.0, USB-C",
+            "battery": "40 Wh",
+            "os": "SteamOS 3",
+            "biometrics": "Нет",
+            "charging": "USB-C PD 45 W",
+            "warranty": STORE_WARRANTY_DEFAULT,
+        })
+        if not str(next_payload.get("description") or "").strip():
+            next_payload["description"] = build_known_product_description(
+                raw_name,
+                "портативная игровая консоль",
+                ["Дисплей: 7.0\" IPS", "ОЗУ: 16 GB", f"Память: {inferred_storage or '256 GB'}", "ОС: SteamOS 3"],
+            )
+        return next_payload
 
-Верни результат СТРОГО в формате JSON, без приветствий, без пояснений, без markdown.
-Ключи должны идти строго в таком порядке (чтобы ты сначала собрал характеристики, а артикул и описание выдал в конце):
+    if "nintendo switch 2" in lower:
+        fill_many({
+            "brand": "Nintendo",
+            "country_sim": "Япония",
+            "weight": "0.534",
+            "storage": inferred_storage or "256 GB",
+            "display": '7.9" LCD, 120 Гц',
+            "processor": "NVIDIA custom processor",
+            "camera": "Нет",
+            "front_camera": "Нет",
+            "video": "До 4K в ТВ-режиме / до 1080p в портативном режиме",
+            "connectivity": "Wi-Fi 6, Bluetooth, USB-C, NFC",
+            "battery": "5220 мАч",
+            "os": "Nintendo Switch system software",
+            "biometrics": "Нет",
+            "charging": "USB-C",
+            "warranty": STORE_WARRANTY_DEFAULT,
+        })
+        if not str(next_payload.get("description") or "").strip():
+            next_payload["description"] = build_known_product_description(
+                raw_name,
+                "портативная игровая консоль",
+                ["Дисплей: 7.9\" LCD 120 Гц", f"Память: {inferred_storage or '256 GB'}", "Вывод изображения: до 4K в док-режиме"],
+            )
+        return next_payload
+
+    if "nintendo switch oled" in lower:
+        fill_many({
+            "brand": "Nintendo",
+            "country_sim": "Япония",
+            "weight": "0.420",
+            "storage": inferred_storage or "64 GB",
+            "display": '7.0" OLED',
+            "processor": "NVIDIA custom processor",
+            "camera": "Нет",
+            "front_camera": "Нет",
+            "video": "До 1080p в ТВ-режиме / 720p в портативном режиме",
+            "connectivity": "Wi-Fi, Bluetooth 4.1, USB-C, NFC",
+            "battery": "До 9 часов работы",
+            "os": "Nintendo Switch system software",
+            "biometrics": "Нет",
+            "charging": "USB-C",
+            "warranty": STORE_WARRANTY_DEFAULT,
+        })
+        if not str(next_payload.get("description") or "").strip():
+            next_payload["description"] = build_known_product_description(
+                raw_name,
+                "портативная игровая консоль",
+                ["Дисплей: 7.0\" OLED", f"Память: {inferred_storage or '64 GB'}", "Вывод изображения: до Full HD в ТВ-режиме"],
+            )
+        return next_payload
+
+    if "nintendo switch lite" in lower:
+        fill_many({
+            "brand": "Nintendo",
+            "country_sim": "Япония",
+            "weight": "0.275",
+            "storage": inferred_storage or "32 GB",
+            "display": '5.5" LCD',
+            "processor": "NVIDIA custom processor",
+            "camera": "Нет",
+            "front_camera": "Нет",
+            "video": "До 720p на встроенном экране",
+            "connectivity": "Wi-Fi, Bluetooth, USB-C",
+            "battery": "До 7 часов работы",
+            "os": "Nintendo Switch system software",
+            "biometrics": "Нет",
+            "charging": "USB-C",
+            "warranty": STORE_WARRANTY_DEFAULT,
+        })
+        if not str(next_payload.get("description") or "").strip():
+            next_payload["description"] = build_known_product_description(
+                raw_name,
+                "портативная игровая консоль",
+                ["Дисплей: 5.5\" LCD", f"Память: {inferred_storage or '32 GB'}", "Формат: компактная портативная версия"],
+            )
+        return next_payload
+
+    if re.search(r"\bnintendo switch\b", lower):
+        fill_many({
+            "brand": "Nintendo",
+            "country_sim": "Япония",
+            "weight": "0.398",
+            "storage": inferred_storage or "32 GB",
+            "display": '6.2" LCD',
+            "processor": "NVIDIA custom processor",
+            "camera": "Нет",
+            "front_camera": "Нет",
+            "video": "До 1080p в ТВ-режиме / 720p в портативном режиме",
+            "connectivity": "Wi-Fi, Bluetooth 4.1, USB-C, NFC",
+            "battery": "До 9 часов работы",
+            "os": "Nintendo Switch system software",
+            "biometrics": "Нет",
+            "charging": "USB-C",
+            "warranty": STORE_WARRANTY_DEFAULT,
+        })
+        if not str(next_payload.get("description") or "").strip():
+            next_payload["description"] = build_known_product_description(
+                raw_name,
+                "портативная игровая консоль",
+                ["Дисплей: 6.2\" LCD", f"Память: {inferred_storage or '32 GB'}", "Вывод изображения: до Full HD в ТВ-режиме"],
+            )
+        return next_payload
+
+    if any(marker in lower for marker in ("rog ally", "legion go", "xbox ally")):
+        handheld_brand = sanitize_brand_value(next_payload.get("brand")) or detect_brand_from_inputs(raw_name, article)
+        processor = infer_handheld_processor(raw_name)
+        fill_many({
+            "brand": handheld_brand,
+            "country_sim": infer_brand_country_fallback(handheld_brand),
+            "storage": inferred_storage,
+            "ram": inferred_ram,
+            "processor": processor,
+            "camera": "Нет",
+            "front_camera": "Нет",
+            "os": "SteamOS" if "steamos" in lower else "Windows 11",
+            "biometrics": "Нет",
+            "charging": "USB-C PD",
+            "warranty": STORE_WARRANTY_DEFAULT,
+        })
+        if not str(next_payload.get("description") or "").strip():
+            highlights = []
+            if processor:
+                highlights.append(f"Процессор: {processor}")
+            if inferred_ram:
+                highlights.append(f"ОЗУ: {inferred_ram}")
+            if inferred_storage:
+                highlights.append(f"Память: {inferred_storage}")
+            next_payload["description"] = build_known_product_description(
+                raw_name,
+                "портативная игровая консоль",
+                highlights,
+                "Формат: компактная игровая система для портативного использования.",
+            )
+        return next_payload
+
+    return next_payload
+
+
+def has_apple_part_number(product_name):
+    return bool(APPLE_PART_NUMBER_PATTERN.search(str(product_name or "")))
+
+
+def extract_apple_model_no(value):
+    match = APPLE_PART_NUMBER_PATTERN.search(str(value or ""))
+    if not match:
+        return ""
+    return match.group(0).split("/")[0].upper()
+
+
+def detect_brand_from_inputs(product_name, article=""):
+    if has_apple_part_number(article) or has_apple_part_number(product_name):
+        return "Apple"
+    return detect_brand_from_name(product_name)
+
+
+def looks_like_iphone_shorthand(product_name):
+    normalized = str(product_name or "").strip().lower()
+    if normalized.startswith("iphone "):
+        return True
+    if re.match(r"^(?:📱\s*)?se(?:\s+2022)?\b", normalized):
+        return True
+    return bool(re.match(r"^(?:📱\s*)?(?:\d{2}|\d{2}[a-z]?)(?:\s+(?:pro max|pro|plus|mini|air|e))?\b", normalized))
+
+
+def detect_iphone_model_family(product_name):
+    normalized = re.sub(r"^iphone\s+", "", str(product_name or "").strip(), flags=re.IGNORECASE)
+    normalized = SIM_INLINE_VARIANT_PATTERN.sub("", normalized)
+    normalized = normalized.lower().strip()
+    for pattern, family in IPHONE_MODEL_PATTERNS:
+        if re.search(pattern, normalized):
+            return family
+    return ""
+
+
+def is_apple_iphone_product(product_name, brand=""):
+    normalized_brand = str(brand or "").strip()
+    if normalized_brand and normalized_brand != "Apple":
+        return False
+    if not looks_like_iphone_shorthand(product_name):
+        return False
+    return normalized_brand == "Apple" or detect_brand_from_name(product_name) == "Apple"
+
+
+def infer_iphone_weight_from_name(product_name):
+    family = detect_iphone_model_family(product_name)
+    return normalize_autofill_weight(IPHONE_MODEL_WEIGHT_MAP.get(family, ""))
+
+
+def normalize_iphone_os_value(value, product_name, brand=""):
+    raw = str(value or "").strip()
+    if not is_apple_iphone_product(product_name, brand):
+        return raw
+    if not raw or raw.lower() == "ios":
+        return DEFAULT_IPHONE_OS_VERSION
+    return raw
+
+
+def detect_condition_marker(product_name):
+    normalized = str(product_name or "").lower()
+    if "asis" in normalized:
+        return "ASIS"
+    if "cpo" in normalized:
+        return "CPO"
+    return ""
+
+
+def extract_country_flags(product_name):
+    text = str(product_name or "")
+    known_flags = (
+        IPHONE_17_PRO_ESIM_FLAGS
+        | IPHONE_17_PRO_GLOBAL_FLAGS
+        | IPHONE_17_PRO_2SIM_FLAGS
+        | IPHONE_14_16_ESIM_FLAGS
+        | IPHONE_14_16_2SIM_FLAGS
+        | {"🇮🇳", "🇷🇺", "🇲🇾", "🇮🇩", "🇰🇿", "🇨🇦", "🇯🇵", "🇦🇪", "🇪🇺", "🇬🇧", "🇦🇺", "🇰🇷"}
+    )
+    return [flag for flag in known_flags if flag in text]
+
+
+def infer_iphone_variant_from_flags(product_name):
+    name = str(product_name or "")
+    flags = set(extract_country_flags(name))
+    lower = name.lower()
+    if not flags:
+        return ""
+
+    if "17 air" in lower:
+        if "🇨🇳" in flags:
+            return ""
+        return "eSim Only"
+
+    if "17 pro max" in lower or re.search(r"\b17\s+pro\b", lower):
+        if flags & IPHONE_17_PRO_2SIM_FLAGS:
+            return "Китай"
+        if flags & IPHONE_17_PRO_ESIM_FLAGS:
+            return "eSim Only"
+        if flags & IPHONE_17_PRO_GLOBAL_FLAGS:
+            return "Глобальная версия"
+        return ""
+
+    if re.search(r"\b1[456](?:e)?\b", lower) or "14 plus" in lower or "14 pro" in lower or "15 plus" in lower or "15 pro" in lower or "16 plus" in lower or "16 pro" in lower:
+        if flags & IPHONE_14_16_2SIM_FLAGS:
+            return "Китай"
+        if flags & IPHONE_14_16_ESIM_FLAGS:
+            return "eSim Only"
+        return "Глобальная версия"
+
+    return ""
+
+
+def detect_variant_folder_name(product_name):
+    normalized = re.sub(r"\s+", "", str(product_name or "").lower())
+    if "2sim" in normalized:
+        return "2sim"
+    if "1sim+esim" in normalized or "sim+esim" in normalized or "1sim" in normalized:
+        return "sim+esim"
+    if "esim" in normalized:
+        return "esim"
+    return ""
+
+
+def detect_country_variant(product_name):
+    variant_folder_name = detect_variant_folder_name(product_name)
+    if variant_folder_name == "2sim":
+        return "Китай"
+    if variant_folder_name == "sim+esim":
+        return "Глобальная версия"
+    if variant_folder_name == "esim":
+        return "eSim Only"
+    inferred_variant = infer_iphone_variant_from_flags(product_name)
+    if inferred_variant:
+        return inferred_variant
+    return ""
+
+
+def normalize_folder_id(value):
+    if value in (None, "", "null", "None"):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_variant_folder_name(folder_name):
+    return str(folder_name or "").strip().lower() in VARIANT_FOLDER_NAMES
+
+
+def is_storage_folder_name(folder_name):
+    normalized_name = re.sub(r"\s+", "", str(folder_name or "").strip())
+    return bool(STORAGE_FOLDER_NAME_RE.fullmatch(normalized_name))
+
+
+def get_user_folder(db, user_id, folder_id):
+    normalized_folder_id = normalize_folder_id(folder_id)
+    if not normalized_folder_id:
+        return None
+    return db.execute(
+        "SELECT id, name, parent_id FROM folders WHERE id = ? AND user_id = ?",
+        (normalized_folder_id, user_id),
+    ).fetchone()
+
+
+def normalize_folder_lookup_name(folder_name):
+    return normalize_folder_display_name(folder_name).casefold()
+
+
+def find_folder_by_name_and_parent(db, user_id, folder_name, parent_id):
+    normalized_name = normalize_folder_lookup_name(folder_name)
+    if not normalized_name:
+        return None
+    normalized_parent_id = normalize_folder_id(parent_id)
+    if normalized_parent_id is None:
+        rows = db.execute(
+            "SELECT id, name, parent_id FROM folders WHERE user_id = ? AND parent_id IS NULL ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id, name, parent_id FROM folders WHERE user_id = ? AND parent_id = ? ORDER BY id",
+            (user_id, normalized_parent_id),
+        ).fetchall()
+    for row in rows:
+        if normalize_folder_lookup_name(row["name"]) == normalized_name:
+            return row
+    return None
+
+
+def ensure_named_folder(db, user_id, folder_name, parent_id):
+    display_name = normalize_folder_display_name(folder_name)
+    normalized_name = normalize_folder_lookup_name(display_name)
+    if not normalized_name:
+        return normalize_folder_id(parent_id)
+    existing = find_folder_by_name_and_parent(db, user_id, display_name, parent_id)
+    if existing:
+        return int(existing["id"])
+    cursor = db.execute(
+        "INSERT INTO folders (user_id, name, parent_id) VALUES (?, ?, ?)",
+        (user_id, display_name, normalize_folder_id(parent_id)),
+    )
+    return int(cursor.lastrowid)
+
+
+def get_folder_path_names(db, user_id, folder_id):
+    normalized_folder_id = normalize_folder_id(folder_id)
+    visited = set()
+    path = []
+    while normalized_folder_id and normalized_folder_id not in visited:
+        visited.add(normalized_folder_id)
+        folder = get_user_folder(db, user_id, normalized_folder_id)
+        if not folder:
+            break
+        path.append(normalize_folder_display_name(folder["name"]))
+        normalized_folder_id = normalize_folder_id(folder["parent_id"])
+    return list(reversed(path))
+
+
+def folder_path_startswith(db, user_id, folder_id, expected_path):
+    actual_path = [part.lower() for part in get_folder_path_names(db, user_id, folder_id)]
+    expected = [str(part or "").strip().lower() for part in expected_path if str(part or "").strip()]
+    if len(actual_path) < len(expected):
+        return False
+    return actual_path[:len(expected)] == expected
+
+
+def detect_storage_folder_name(product_name="", storage_value=""):
+    normalized_storage = normalize_capacity(storage_value, allow_tb=True)
+    if normalized_storage:
+        return normalized_storage.replace(" ", "")
+
+    text = str(product_name or "")
+    explicit_match = re.search(r"\b(\d+(?:\.\d+)?)\s*(TB|GB)\b", text, re.IGNORECASE)
+    if explicit_match:
+        return f"{explicit_match.group(1)}{explicit_match.group(2).upper()}"
+
+    bare_match = re.search(r"\b(64|128|256|512|1024|2048)\b", text)
+    if not bare_match:
+        return ""
+
+    amount = bare_match.group(1)
+    if amount == "1024":
+        return "1TB"
+    if amount == "2048":
+        return "2TB"
+    return f"{amount}GB"
+
+
+def normalize_folder_path_parts(parts):
+    normalized_parts = []
+    for part in parts or ():
+        display_name = normalize_folder_display_name(part)
+        if display_name:
+            normalized_parts.append(display_name)
+    return tuple(normalized_parts)
+
+
+def folder_path_equals_parts(actual_path, expected_path):
+    actual = [part.casefold() for part in normalize_folder_path_parts(actual_path)]
+    expected = [part.casefold() for part in normalize_folder_path_parts(expected_path)]
+    return actual == expected
+
+
+def infer_airpods_model_folder_name(product_name):
+    normalized_name = re.sub(r"\s+", " ", str(product_name or "").strip()).lower()
+    if not normalized_name:
+        return None
+    if "airpods max 2" in normalized_name:
+        return "AirPods Max 2"
+    if "airpods max" in normalized_name:
+        return "AirPods Max"
+    if "airpods pro 3" in normalized_name:
+        return "AirPods Pro 3"
+    if "airpods pro 2" in normalized_name or ("airpods pro" in normalized_name and "type-c" in normalized_name):
+        return "AirPods Pro 2 (Type-C)"
+    if "airpods 4" in normalized_name:
+        if any(marker in normalized_name for marker in ("anc", "шумоподав", "noise cancel")):
+            return "AirPods 4 с активным шумоподавлением"
+        return "AirPods 4"
+    if "airpods 3" in normalized_name:
+        return "AirPods 3"
+    if "airpods 2" in normalized_name:
+        return "AirPods 2"
+    return None
+
+
+def infer_specific_catalog_folder_path(product_name, current_path, storage_value=""):
+    normalized_name = re.sub(r"\s+", " ", str(product_name or "").strip())
+    lower_name = normalized_name.lower()
+    normalized_path = normalize_folder_path_parts(current_path)
+    if not normalized_name or not normalized_path:
+        return None
+
+    if folder_path_equals_parts(normalized_path, DATA_CABLES_CATALOG_PATH):
+        if "apple watch" in lower_name:
+            return (*WATCH_CHARGERS_CATALOG_PATH, "Watch")
+        if "galaxy watch" in lower_name or "samsung watch" in lower_name:
+            return (*WATCH_CHARGERS_CATALOG_PATH, "Samsung")
+        if any(marker in lower_name for marker in ("xiaomi watch", "redmi watch", "mi band")):
+            return (*WATCH_CHARGERS_CATALOG_PATH, "Xiaomi")
+        if "magsafe 3" in lower_name or ("mag safe 3" in lower_name) or ("macbook" in lower_name and "magsafe" in lower_name):
+            return (*NETWORK_CHARGERS_CATALOG_PATH, "СЗУ для ноутбука")
+        if "lightning" in lower_name:
+            return (*DATA_CABLES_CATALOG_PATH, "Дата-кабели Lightning")
+        if "micro" in lower_name:
+            return (*DATA_CABLES_CATALOG_PATH, "Дата-кабели Micro")
+        if any(marker in lower_name for marker in ("type-c", "usb-c", "thunderbolt")):
+            return (*DATA_CABLES_CATALOG_PATH, "Дата-кабели Type-C")
+        return (*DATA_CABLES_CATALOG_PATH, "Прочие дата-кабели")
+
+    if folder_path_equals_parts(normalized_path, NETWORK_CHARGERS_CATALOG_PATH):
+        watch_target = None
+        has_apple_watch = "apple watch" in lower_name
+        has_samsung_watch = "galaxy watch" in lower_name or "samsung watch" in lower_name
+        has_xiaomi_watch = any(marker in lower_name for marker in ("xiaomi watch", "redmi watch", "mi band"))
+        watch_target_count = sum((has_apple_watch, has_samsung_watch, has_xiaomi_watch))
+        if watch_target_count > 1:
+            watch_target = "Универсальные"
+        elif has_apple_watch:
+            watch_target = "Watch"
+        elif has_samsung_watch:
+            watch_target = "Samsung"
+        elif has_xiaomi_watch:
+            watch_target = "Xiaomi"
+        if watch_target:
+            return (*WATCH_CHARGERS_CATALOG_PATH, watch_target)
+
+        if any(marker in lower_name for marker in ("macbook", "magsafe", "mag safe", "ноутбук")):
+            return (*NETWORK_CHARGERS_CATALOG_PATH, "СЗУ для ноутбука")
+
+        has_bundle_marker = any(marker in lower_name for marker in ("с кабелем", "+ кабель", "with cable"))
+        if has_bundle_marker and "lightning" in lower_name:
+            return (*NETWORK_CHARGERS_CATALOG_PATH, "СЗУ + Lightning")
+        if has_bundle_marker and "micro" in lower_name:
+            return (*NETWORK_CHARGERS_CATALOG_PATH, "СЗУ + Micro")
+        if has_bundle_marker and any(marker in lower_name for marker in ("type-c", "usb-c")):
+            return (*NETWORK_CHARGERS_CATALOG_PATH, "СЗУ + Type-C")
+        return (*NETWORK_CHARGERS_CATALOG_PATH, "СЗУ блок")
+
+    if folder_path_equals_parts(normalized_path, WATCH_CHARGERS_CATALOG_PATH):
+        has_apple_watch = "apple watch" in lower_name
+        has_samsung_watch = "galaxy watch" in lower_name or "samsung watch" in lower_name
+        has_xiaomi_watch = any(marker in lower_name for marker in ("xiaomi watch", "redmi watch", "mi band"))
+        target_count = sum((has_apple_watch, has_samsung_watch, has_xiaomi_watch))
+        if target_count > 1:
+            return (*WATCH_CHARGERS_CATALOG_PATH, "Универсальные")
+        if has_apple_watch:
+            return (*WATCH_CHARGERS_CATALOG_PATH, "Watch")
+        if has_samsung_watch:
+            return (*WATCH_CHARGERS_CATALOG_PATH, "Samsung")
+        if has_xiaomi_watch:
+            return (*WATCH_CHARGERS_CATALOG_PATH, "Xiaomi")
+        return (*WATCH_CHARGERS_CATALOG_PATH, "Универсальные")
+
+    if folder_path_equals_parts(normalized_path, YANDEX_STATION_CATALOG_PATH):
+        if "мини 3 pro" in lower_name or "mini 3 pro" in lower_name:
+            return (*YANDEX_STATION_CATALOG_PATH, "Станция Мини 3 Pro")
+        if "мини 3" in lower_name or "mini 3" in lower_name:
+            return (*YANDEX_STATION_CATALOG_PATH, "Станция Мини 3")
+        if re.search(r"\bстанция\s+3\b", lower_name) and "мини" not in lower_name:
+            return (*YANDEX_STATION_CATALOG_PATH, "Станция 3")
+
+    if folder_path_equals_parts(normalized_path, JBL_SPEAKER_CATALOG_PATH):
+        if "partybox" in lower_name:
+            return (*JBL_SPEAKER_CATALOG_PATH, "PartyBox")
+
+    if folder_path_equals_parts(normalized_path, PLAYSTATION_SUBSCRIPTIONS_CATALOG_PATH):
+        if any(marker in lower_name for marker in ("подпис", "plus", "store", "учетной записи", "учётной записи", "аккаунт", "пополнен")):
+            return (*PLAYSTATION_SUBSCRIPTIONS_CATALOG_PATH, "Подписки")
+        return (*PLAYSTATION_SUBSCRIPTIONS_CATALOG_PATH, "Игры")
+
+    if folder_path_equals_parts(normalized_path, XBOX_SUBSCRIPTIONS_CATALOG_PATH):
+        if any(marker in lower_name for marker in ("подпис", "game pass", "core", "ultimate", "live", "gold", "пополнен")):
+            return (*XBOX_SUBSCRIPTIONS_CATALOG_PATH, "Подписки")
+        return (*XBOX_SUBSCRIPTIONS_CATALOG_PATH, "Игры")
+
+    if folder_path_equals_parts(normalized_path, STEAM_DECK_CATALOG_PATH):
+        target_storage_folder = detect_storage_folder_name(normalized_name, storage_value)
+        if target_storage_folder:
+            return (*STEAM_DECK_CATALOG_PATH, target_storage_folder.replace(" ", ""))
+
+    if folder_path_equals_parts(normalized_path, CONSTRUCTORS_CATALOG_PATH):
+        if "franzis" in lower_name:
+            return (*CONSTRUCTORS_CATALOG_PATH, "Franzis")
+        if "lego" in lower_name or re.search(r"\btechnic\b", lower_name):
+            return (*CONSTRUCTORS_CATALOG_PATH, "LEGO")
+        if any(marker in lower_name for marker in ("xiaomi", "onebot", "dawn of jupiter")):
+            return (*CONSTRUCTORS_CATALOG_PATH, "Xiaomi")
+
+    if folder_path_equals_parts(normalized_path, COMPUTER_ACCESSORIES_CATALOG_PATH):
+        if any(marker in lower_name for marker in ("чех", "case", "storage box", "organizer")):
+            return (*COMPUTER_ACCESSORIES_CATALOG_PATH, "Чехлы и органайзеры")
+        if any(marker in lower_name for marker in ("клавиат", "keyboard")):
+            return (*COMPUTER_ACCESSORIES_CATALOG_PATH, "Клавиатуры")
+        if any(marker in lower_name for marker in ("мыш", "mouse", "трекпад", "trackpad")):
+            return (*COMPUTER_ACCESSORIES_CATALOG_PATH, "Мышки и трекпады")
+        if any(marker in lower_name for marker in ("веб-кам", "webcam")):
+            return (*COMPUTER_ACCESSORIES_CATALOG_PATH, "Веб-камеры")
+        if any(marker in lower_name for marker in ("router", "роутер", "wi-fi", "wifi")):
+            return (*COMPUTER_ACCESSORIES_CATALOG_PATH, "Роутеры и адаптеры Wi-Fi")
+        if any(marker in lower_name for marker in ("hub", "адаптер", "adapter", "dock", "док-станц")):
+            return (*COMPUTER_ACCESSORIES_CATALOG_PATH, "Разветвители и адаптеры")
+        if "графический планшет" in lower_name:
+            return (*COMPUTER_ACCESSORIES_CATALOG_PATH, "Графические планшеты")
+
+    if folder_path_equals_parts(normalized_path, AIRPODS_CATALOG_PATH):
+        if any(marker in lower_name for marker in ("подстав", "holder", "stand")):
+            return ("Электроника", "Аксессуары", "Прочие аксессуары", "Подставки")
+        model_folder_name = infer_airpods_model_folder_name(normalized_name)
+        if model_folder_name:
+            return (*AIRPODS_CATALOG_PATH, model_folder_name)
+
+    return None
+
+
+def infer_iphone_model_folder_name(product_name):
+    normalized_name = re.sub(r"\s+", " ", str(product_name or "").replace("ё", "е").lower()).strip()
+    if not normalized_name:
+        return None
+    for pattern, folder_name in IPHONE_MODEL_FOLDER_PATTERNS:
+        if re.search(pattern, normalized_name):
+            return folder_name
+    return None
+
+
+def ensure_folder_path(db, user_id, folder_names):
+    parent_id = None
+    for folder_name in folder_names:
+        parent_id = ensure_named_folder(db, user_id, folder_name, parent_id)
+    return parent_id
+
+
+def find_or_create_default_model_folder(db, user_id, product_name):
+    if not is_apple_iphone_product(product_name):
+        return None
+    iphone_model_folder_name = infer_iphone_model_folder_name(product_name)
+    if iphone_model_folder_name:
+        return ensure_folder_path(db, user_id, (*IPHONE_CATALOG_PATH, iphone_model_folder_name))
+    return None
+
+
+def resolve_product_folder_assignment(db, user_id, product_name, folder_id=None, storage_value=""):
+    normalized_folder_id = normalize_folder_id(folder_id)
+    target_variant_folder = detect_variant_folder_name(product_name)
+    target_storage_folder = detect_storage_folder_name(product_name, storage_value)
+    inferred_model_folder_id = find_or_create_default_model_folder(db, user_id, product_name)
+
+    current_folder = None
+    if normalized_folder_id:
+        if inferred_model_folder_id and not folder_path_startswith(db, user_id, normalized_folder_id, IPHONE_CATALOG_PATH):
+            current_folder = None
+        else:
+            current_folder = get_user_folder(db, user_id, normalized_folder_id)
+
+    model_folder_id = None
+    variant_folder_id = None
+    if current_folder:
+        current_name = str(current_folder["name"] or "").strip()
+        current_name_lower = current_name.lower()
+        current_parent_id = normalize_folder_id(current_folder["parent_id"])
+        current_path = get_folder_path_names(db, user_id, current_folder["id"])
+
+        if is_storage_folder_name(current_name):
+            parent_variant_folder = get_user_folder(db, user_id, current_parent_id)
+            if parent_variant_folder and is_variant_folder_name(parent_variant_folder["name"]):
+                model_folder_id = normalize_folder_id(parent_variant_folder["parent_id"])
+                if not target_variant_folder or str(parent_variant_folder["name"] or "").strip().lower() == target_variant_folder:
+                    variant_folder_id = int(parent_variant_folder["id"])
+                    if not target_storage_folder or current_name_lower == target_storage_folder.lower():
+                        return int(current_folder["id"])
+            else:
+                model_folder_id = current_parent_id
+                if not target_variant_folder and (not target_storage_folder or current_name_lower == target_storage_folder.lower()):
+                    return int(current_folder["id"])
+        elif is_variant_folder_name(current_name):
+            model_folder_id = current_parent_id
+            if not target_variant_folder or current_name_lower == target_variant_folder:
+                variant_folder_id = int(current_folder["id"])
+        elif inferred_model_folder_id and [part.lower() for part in current_path[:len(IPHONE_CATALOG_PATH)]] == [part.lower() for part in IPHONE_CATALOG_PATH]:
+            if len(current_path) >= len(IPHONE_CATALOG_PATH) + 1:
+                model_folder_id = int(current_folder["id"])
+        else:
+            model_folder_id = int(current_folder["id"])
+
+    if inferred_model_folder_id and not folder_path_startswith(db, user_id, model_folder_id, IPHONE_CATALOG_PATH):
+        model_folder_id = inferred_model_folder_id
+    if model_folder_id is None:
+        model_folder_id = inferred_model_folder_id
+
+    iphone_folder_context = folder_path_startswith(db, user_id, model_folder_id, IPHONE_CATALOG_PATH)
+
+    if target_variant_folder and iphone_folder_context:
+        if variant_folder_id is None:
+            if model_folder_id is None:
+                return normalized_folder_id
+            variant_folder_id = ensure_named_folder(db, user_id, target_variant_folder, model_folder_id)
+        if target_storage_folder:
+            return ensure_named_folder(db, user_id, target_storage_folder, variant_folder_id)
+        return variant_folder_id
+
+    if target_storage_folder and model_folder_id is not None and iphone_folder_context:
+        resolved_folder_id = ensure_named_folder(db, user_id, target_storage_folder, model_folder_id)
+    else:
+        resolved_folder_id = model_folder_id if model_folder_id is not None else normalized_folder_id
+
+    refined_current_path = get_folder_path_names(db, user_id, resolved_folder_id) if resolved_folder_id else []
+    refined_catalog_path = infer_specific_catalog_folder_path(product_name, refined_current_path, storage_value)
+    if refined_catalog_path:
+        return ensure_folder_path(db, user_id, refined_catalog_path)
+    return resolved_folder_id
+
+
+def normalize_autofill_weight(value):
+    raw = str(value or "").strip().replace(",", ".")
+    if not raw:
+        return ""
+    match = re.search(r"(\d+(?:\.\d+)?)", raw)
+    if not match:
+        return ""
+    try:
+        numeric = float(match.group(1))
+    except ValueError:
+        return ""
+    lowered = raw.lower()
+    if "кг" in lowered or "kg" in lowered:
+        grams = numeric * 1000.0
+    elif "г" in lowered:
+        grams = numeric
+    else:
+        grams = numeric * 1000.0 if numeric < 10 else numeric
+    if grams <= 0 or grams >= 100000:
+        return ""
+    return str(int(round(grams)))
+
+
+def normalize_capacity(value, allow_tb=False):
+    raw = str(value or "").strip().upper().replace(" ", "")
+    if not raw:
+        return ""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(GB|TB)", raw)
+    if not match:
+        return ""
+    amount, unit = match.groups()
+    if unit == "TB" and not allow_tb:
+        return ""
+    return f"{amount} {unit}"
+
+
+def capacity_to_gb(value):
+    normalized = normalize_capacity(value, allow_tb=True)
+    if not normalized:
+        return 0.0
+    amount_str, unit = normalized.split()
+    amount = float(amount_str)
+    return amount * 1024.0 if unit == "TB" else amount
+
+
+def extract_ram_storage_from_name(product_name):
+    raw_name = str(product_name or "").replace("ГБ", "GB").replace("гб", "GB").replace("ТБ", "TB").replace("тб", "TB")
+    pair_patterns = (
+        re.compile(r"\b(\d{1,3})\s*/\s*(\d{2,4})\s*(GB|TB)\b", re.IGNORECASE),
+        re.compile(r"\b(\d{1,3})\s*(GB)\s*/\s*(\d{2,4})\s*(GB|TB)\b", re.IGNORECASE),
+    )
+    for pattern in pair_patterns:
+        match = pattern.search(raw_name)
+        if not match:
+            continue
+        groups = match.groups()
+        if len(groups) == 3:
+            ram_amount, storage_amount, storage_unit = groups
+            ram_value = normalize_capacity(f"{ram_amount}GB", allow_tb=False)
+            storage_value = normalize_capacity(f"{storage_amount}{storage_unit}", allow_tb=True)
+        else:
+            ram_amount, ram_unit, storage_amount, storage_unit = groups
+            ram_value = normalize_capacity(f"{ram_amount}{ram_unit}", allow_tb=False)
+            storage_value = normalize_capacity(f"{storage_amount}{storage_unit}", allow_tb=True)
+        if ram_value or storage_value:
+            return ram_value, storage_value
+
+    capacities = []
+    for amount, unit in re.findall(r"\b(\d+(?:\.\d+)?)\s*(GB|TB)\b", raw_name, flags=re.IGNORECASE):
+        normalized = normalize_capacity(f"{amount}{unit}", allow_tb=True)
+        if normalized:
+            capacities.append(normalized)
+    unique_capacities = []
+    seen = set()
+    for capacity in capacities:
+        key = capacity.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_capacities.append(capacity)
+    if not unique_capacities:
+        return "", ""
+    if len(unique_capacities) == 1:
+        return "", unique_capacities[0]
+    ordered = sorted(unique_capacities, key=capacity_to_gb)
+    ram_candidate = ordered[0] if capacity_to_gb(ordered[0]) <= 64 else ""
+    storage_candidate = ordered[-1]
+    if ram_candidate and ram_candidate.lower() == storage_candidate.lower():
+        ram_candidate = ""
+    return ram_candidate, storage_candidate
+
+
+def infer_basic_os(product_name, brand=""):
+    lower = str(product_name or "").lower()
+    normalized_brand = str(brand or "").strip()
+    if normalized_brand == "Apple":
+        if "ipad" in lower:
+            return "iPadOS"
+        if "watch" in lower:
+            return "watchOS"
+        if any(marker in lower for marker in ("macbook", "imac", "mac mini", "mac studio", "mac pro")):
+            return "macOS"
+        if "vision pro" in lower:
+            return "visionOS"
+        if any(marker in lower for marker in ("iphone",)):
+            return DEFAULT_IPHONE_OS_VERSION
+        return ""
+    if normalized_brand in ANDROID_BRANDS:
+        return "Android"
+    if "galaxy watch" in lower or "wear os" in lower:
+        return "Wear OS"
+    return ""
+
+
+def normalize_model_no(value, brand):
+    model_no = str(value or "").strip().upper()
+    if not model_no:
+        return ""
+    if brand == "Apple":
+        return model_no if re.fullmatch(r"M[A-Z0-9]{4}", model_no) else ""
+    if len(model_no) > 32:
+        return ""
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9\-/ ]{1,31}", model_no):
+        return ""
+    if not re.search(r"\d", model_no):
+        return ""
+    return model_no
+
+
+def strip_description_notes(description):
+    raw_text = str(description or "").replace("\r", "")
+    raw_text = re.sub(r"<[^>]+>", " ", raw_text)
+    raw_text = raw_text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&quot;", '"')
+    raw_text = re.sub(r"читать полностью.*", "", raw_text, flags=re.IGNORECASE)
+    for note in (AUTOFILL_REQUIRED_NOTE, AUTOFILL_APPLE_NOTE):
+        raw_text = re.sub(rf"\s*{re.escape(note)}\s*", "\n", raw_text, flags=re.IGNORECASE)
+    raw_text = re.sub(r"\s*без\s+rustore\s*", "\n", raw_text, flags=re.IGNORECASE)
+    lines = [line.rstrip() for line in raw_text.split("\n")]
+    banned_lines = {
+        AUTOFILL_REQUIRED_NOTE.lower(),
+        AUTOFILL_APPLE_NOTE.lower(),
+    }
+    cleaned_lines = []
+    for line in lines:
+        normalized_line = line.strip().lower()
+        if not normalized_line:
+            cleaned_lines.append(line)
+            continue
+        if normalized_line in banned_lines:
+            continue
+        if any(marker in normalized_line for marker in DESCRIPTION_TEMPLATE_MARKERS):
+            continue
+        if normalized_line.startswith("преимущества модели:"):
+            continue
+        if normalized_line.startswith("исполнение:") or normalized_line.startswith("ключевые характеристики:"):
+            continue
+        if "rustore" in normalized_line:
+            continue
+        if normalized_line.startswith("недостатки:"):
+            continue
+        if normalized_line == "◊ юридическая информация" or normalized_line.startswith("юридическая информация"):
+            continue
+        if "apple.com/" in normalized_line:
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def remove_sim_mentions_from_description(description):
+    text = SIM_INLINE_VARIANT_PATTERN.sub("", str(description or "").replace("\r", ""))
+    parts = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    cleaned_parts = []
+    for part in parts:
+        if SIM_DESCRIPTION_PATTERN.search(part):
+            continue
+        cleaned_parts.append(part)
+    return "\n\n".join(cleaned_parts).strip()
+
+
+def infer_description_kind_from_name(product_name):
+    lower = str(product_name or "").lower()
+    if not lower:
+        return ""
+    if any(marker in lower for marker in ("чех", "case", "cover")):
+        return "case"
+    if any(marker in lower for marker in ("ремеш", "strap", "браслет для")):
+        return "strap"
+    if any(marker in lower for marker in ("стекл", "пленк", "protector", "glass")):
+        return "protection"
+    if any(marker in lower for marker in ("держател", "mount", "stand", "подстав")):
+        return "mount"
+    if any(marker in lower for marker in ("кабель", "cable")):
+        return "cable"
+    if any(marker in lower for marker in ("заряд", "charger", "адаптер")):
+        return "charger"
+    if any(marker in lower for marker in ("airpods", "науш", "гарнитур", "buds")):
+        return "headphones"
+    if any(marker in lower for marker in ("колонк", "speaker", "homepod", "станция")):
+        return "speaker"
+    if any(marker in lower for marker in ("watch", "часы", "fit")):
+        return "watch"
+    if any(marker in lower for marker in ("ipad", "планш")):
+        return "tablet"
+    if any(marker in lower for marker in ("macbook", "ноут", "laptop")):
+        return "laptop"
+    if looks_like_iphone_shorthand(product_name) or any(marker in lower for marker in ("iphone", "смартфон", "galaxy", "pixel", "redmi note", "nothing phone")):
+        return "smartphone"
+    return ""
+
+
+def should_append_apple_notes(brand, product_name="", kind=""):
+    if str(brand or "").strip() != "Apple":
+        return False
+    effective_kind = str(kind or "").strip().lower() or infer_description_kind_from_name(product_name)
+    if effective_kind in APPLE_DESCRIPTION_NOTE_KINDS:
+        return True
+    lower = str(product_name or "").lower()
+    return any(marker in lower for marker in ("iphone", "ipad", "macbook", "apple watch", "imac", "mac mini", "vision pro"))
+
+
+def finalize_description(description, brand, product_name="", kind=""):
+    base_description = remove_sim_mentions_from_description(strip_description_notes(description))
+    parts = []
+    seen_parts = set()
+    for part in re.split(r"\n\s*\n", base_description):
+        cleaned_part = re.sub(r"\s+", " ", str(part or "").strip())
+        normalized_part = cleaned_part.lower()
+        if not cleaned_part or normalized_part in seen_parts:
+            continue
+        seen_parts.add(normalized_part)
+        parts.append(cleaned_part)
+    return "\n\n".join(parts[:4]).strip()
+
+
+def build_synonyms(product_name, brand, article=""):
+    original = re.sub(r"\s+", " ", str(product_name or "").strip())
+    if not original:
+        return []
+
+    def append_variant(variants_list, value):
+        cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+        if cleaned:
+            variants_list.append(cleaned)
+
+    variants = []
+    variant_match = re.search(r"\(([^)]*(?:e\s*sim|sim)[^)]*)\)", original, re.IGNORECASE)
+    variant_suffix = variant_match.group(1).strip() if variant_match else ""
+    variant_suffix_lower = variant_suffix.lower()
+    no_variant = (
+        original[:variant_match.start()] + " " + original[variant_match.end():]
+        if variant_match else original
+    )
+    no_variant = re.sub(r"\s+", " ", no_variant).strip()
+    storage_case_normalized = re.sub(
+        r"\b(\d+(?:\.\d+)?)\s*(gb|tb)\b",
+        lambda match: f"{match.group(1)}{match.group(2).upper()}",
+        no_variant,
+        flags=re.IGNORECASE,
+    )
+    storage_case_normalized = re.sub(r"\s+", " ", storage_case_normalized).strip()
+    normalized_storage = re.sub(
+        r"(?<!\d)(\d{3,4})(?!\s*(?:GB|TB)\b)(?=\s+[A-Za-z])",
+        r"\1GB",
+        storage_case_normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized_storage = re.sub(r"\s+", " ", normalized_storage).strip()
+    base_name = normalized_storage or storage_case_normalized or no_variant
+    article_model_no = extract_apple_model_no(article) or extract_apple_model_no(product_name)
+
+    if no_variant and no_variant.lower() != original.lower():
+        append_variant(variants, no_variant)
+    if storage_case_normalized and storage_case_normalized.lower() not in {original.lower(), no_variant.lower()}:
+        append_variant(variants, storage_case_normalized)
+    if no_variant and variant_suffix:
+        append_variant(variants, f"{no_variant} {variant_suffix}")
+        if variant_suffix_lower == "1sim+esim":
+            append_variant(variants, f"{no_variant} 1Sim")
+        elif variant_suffix_lower == "esim":
+            append_variant(variants, f"{no_variant} eSim")
+        elif variant_suffix_lower == "2sim":
+            append_variant(variants, f"{no_variant} 2Sim")
+    if storage_case_normalized and variant_suffix:
+        append_variant(variants, f"{storage_case_normalized} {variant_suffix}")
+        if variant_suffix_lower == "1sim+esim":
+            append_variant(variants, f"{storage_case_normalized} 1Sim")
+        elif variant_suffix_lower == "esim":
+            append_variant(variants, f"{storage_case_normalized} eSim")
+        elif variant_suffix_lower == "2sim":
+            append_variant(variants, f"{storage_case_normalized} 2Sim")
+    if normalized_storage and normalized_storage.lower() not in {original.lower(), no_variant.lower()}:
+        append_variant(variants, normalized_storage)
+        if variant_suffix:
+            append_variant(variants, f"{normalized_storage} {variant_suffix}")
+            if variant_suffix_lower == "1sim+esim":
+                append_variant(variants, f"{normalized_storage} 1Sim")
+            elif variant_suffix_lower == "esim":
+                append_variant(variants, f"{normalized_storage} eSim")
+            elif variant_suffix_lower == "2sim":
+                append_variant(variants, f"{normalized_storage} 2Sim")
+    if (
+        brand == "Apple"
+        and normalized_storage
+        and looks_like_iphone_shorthand(original)
+        and not normalized_storage.lower().startswith("iphone ")
+        and not has_apple_part_number(original)
+    ):
+        append_variant(variants, f"iPhone {normalized_storage}")
+        if variant_suffix:
+            append_variant(variants, f"iPhone {normalized_storage} {variant_suffix}")
+            if variant_suffix_lower == "1sim+esim":
+                append_variant(variants, f"iPhone {normalized_storage} 1Sim")
+            elif variant_suffix_lower == "esim":
+                append_variant(variants, f"iPhone {normalized_storage} eSim")
+            elif variant_suffix_lower == "2sim":
+                append_variant(variants, f"iPhone {normalized_storage} 2Sim")
+    if brand == "Apple" and base_name and APPLE_FAMILY_PREFIX_PATTERN.match(base_name):
+        if not base_name.lower().startswith("apple "):
+            append_variant(variants, f"Apple {base_name}")
+            if variant_suffix:
+                append_variant(variants, f"Apple {base_name} {variant_suffix}")
+        if article_model_no:
+            append_variant(variants, f"{base_name} {article_model_no}")
+            if not base_name.lower().startswith("apple "):
+                append_variant(variants, f"Apple {base_name} {article_model_no}")
+
+    unique_variants = []
+    seen = {original.lower()}
+    for variant in variants:
+        key = variant.lower()
+        if not variant or key in seen:
+            continue
+        seen.add(key)
+        unique_variants.append(variant)
+        if len(unique_variants) >= 5:
+            break
+    return unique_variants
+
+
+def build_offline_autofill_payload(product_name, article=""):
+    brand = sanitize_brand_value(detect_brand_from_inputs(product_name, article))
+    ram_value, storage_value = extract_ram_storage_from_name(product_name)
+    apple_model_no = extract_apple_model_no(article) or extract_apple_model_no(product_name)
+    payload = {key: "" for key in AUTOFILL_RESPONSE_KEYS}
+    payload["brand"] = brand
+    payload["country_sim"] = detect_country_variant(product_name) or infer_accessory_country_fallback(product_name, brand)
+    payload["weight"] = infer_iphone_weight_from_name(product_name) if is_apple_iphone_product(product_name, brand) else ""
+    payload["storage"] = storage_value
+    payload["ram"] = ram_value
+    payload["model_no"] = apple_model_no if brand == "Apple" else ""
+    payload["os"] = infer_basic_os(product_name, brand)
+    payload["warranty"] = STORE_WARRANTY_DEFAULT
+    payload["description"] = ""
+    payload = supplement_autofill_payload_from_known_products(product_name, article, payload)
+    payload = supplement_autofill_payload_from_catalog(product_name, article, payload)
+    return normalize_autofill_payload(product_name, payload, article)
+
+
+def build_autofill_prompt(product_name, article=""):
+    article_line = f'Артикул / part number: "{article}"\n' if article else ""
+    return f"""
+Ты заполняешь карточку товара для магазина в русском стиле.
+Товар: "{product_name}"
+{article_line}Данные должны быть актуальны на 2026 год и позже, включая текущее состояние на момент запроса.
+Если можешь использовать онлайн-поиск, обязательно опирайся на него. Если в точности не уверен, оставляй поле пустым.
+Если артикул передан, сначала выполни поиск именно по точному артикулу в кавычках и только потом сверяй название товара.
+
+СТИЛЬ КАРТОЧКИ:
+1. Описание только на русском языке.
+2. Тон строго под российский интернет-магазин: деловой, понятный, без англоязычного маркетингового мусора.
+3. 3 коротких абзаца без списков и markdown.
+4. Первое предложение начинай с точного названия модели в стиле: "iPhone 17 Pro — ...", "Samsung Galaxy S25 — ...".
+5. Не добавляй в описание служебные пометки вроде "Версия без RuStore", "Без RuStore", "Оригинальная продукция Apple".
+6. Не перечисляй характеристики списком внутри описания и не дублируй поля карточки дословно.
+
+ПРАВИЛА:
+- Если название вида "17", "17 Pro", "17 Pro Max", "17 Air", "17e" без бренда, считай что это iPhone соответствующей модели.
+- Если в названии есть ASIS, это б/у товар. Не описывай его как новый, запечатанный или заводской.
+- Если в названии есть CPO, это Certified Pre-Owned. Тоже не описывай как абсолютно новый товар.
+- Флаги стран вроде 🇮🇳 🇦🇪 🇭🇰 🇯🇵 — это регион поставки/происхождения и подсказка для поиска, но НЕ значение поля country_sim.
+- Если в названии есть Apple part number вроде "MQL03", "MU773", "MC7X4", ты ОБЯЗАН определить устройство именно по part number через онлайн-поиск. Никогда не трактуй такой код как номер iPhone.
+- Если артикул передан отдельно, он важнее названия для определения точной модели и конфигурации.
+- При конфликте между названием и артикулом доверяй артикулу, а не догадке по названию.
+- Для Apple part number сначала ищи точное совпадение part number, затем сверяй цвет, память и тип устройства. Если тип устройства не совпал, не заполняй догадкой.
+- Если запрос невозможно подтвердить онлайн, лучше верни пустые поля, чем неправильную модель.
+- Если это Apple, постарайся заполнить максимум подтверждаемых полей в стиле карточек магазина: display, processor, camera, front_camera, connectivity, os, biometrics, charging.
+- Не выдумывай артикулы, вес, камеры, RAM, частоты, батарею и SIM-версию.
+- Если поле не удалось подтвердить, верни "".
+- Цвет только на английском, как в названии.
+- storage и ram возвращай только с пробелом: "256 GB", "8 GB", "1 TB".
+- Гарантия всегда "12 месяцев".
+- country_sim только из этого набора, если можно определить по названию:
+  eSIM -> "eSim Only"
+  1SIM+eSIM / SIM+eSIM -> "Глобальная версия"
+  2SIM -> "Китай"
+- model_no для Apple только если это реальный код из 5 символов, начинающийся на M.
+
+Верни только JSON без пояснений.
 {{
 "brand": "",
 "country_sim": "",
@@ -337,20 +2059,637 @@ def autofill():
 }}
     """
 
+
+def call_gemini_online(prompt):
+    if not google_genai_sdk or not google_genai_types:
+        raise RuntimeError("Модуль google-genai не установлен, онлайн-поиск Gemini недоступен")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY не задан")
+    client = google_genai_sdk.Client(api_key=GEMINI_API_KEY)
+    last_error = None
+    for model_name in AUTOFILL_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=google_genai_types.GenerateContentConfig(
+                    temperature=0.1,
+                    tools=[google_genai_types.Tool(google_search=google_genai_types.GoogleSearch())],
+                ),
+            )
+            response_text = getattr(response, "text", None)
+            if response_text and response_text.strip():
+                return response_text.strip()
+            raise RuntimeError(f"{model_name} вернул пустой ответ после онлайн-поиска")
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Gemini online grounding недоступен на {model_name}: {e}")
+    raise RuntimeError(
+        f"Онлайн-поиск Gemini сейчас недоступен. Автозаполнение остановлено, чтобы не подставлять устаревшие или выдуманные данные. Последняя ошибка: {last_error}"
+    )
+
+
+def parse_autofill_json(result_text):
+    cleaned = str(result_text or "").replace("```json", "").replace("```", "").strip()
+    if not cleaned:
+        raise RuntimeError("Gemini вернул пустой ответ")
     try:
-        # Используем gemini-1.5-flash (самая быстрая и дешевая для таких задач)
-        model = genai.GenerativeModel('gemini-3.1-flash-lite-preview')
-        response = model.generate_content(prompt)
-        
-        # Убираем возможную разметку ```json ... ``` которую иногда выдает ИИ
-        result_text = response.text.replace('```json', '').replace('```', '').strip()
-        
-        parsed_data = json.loads(result_text)
-        return jsonify(parsed_data)
-        
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(cleaned[start:end + 1])
+        raise
+
+
+def supplement_autofill_payload_from_catalog(product_name, article="", payload=None):
+    next_payload = dict(payload or {})
+    try:
+        from scripts import backfill_cmstore_product_details as bf
+        from scripts import fill_catalog_from_cmstore as fc
+    except Exception as e:
+        logger.warning(f"Не удалось подключить каталоговый добор ТХ: {e}")
+        return next_payload
+
+    source_url = str(next_payload.get("source_url") or "").strip()
+    if not source_url:
+        try:
+            candidate, score = bf.choose_candidate(product_name, timeout=20)
+        except Exception as e:
+            logger.warning(f"Поиск карточки-донора для '{product_name}' не удался: {e}")
+            return next_payload
+        if not candidate or score < AUTOFILL_SUPPLEMENT_MIN_SCORE:
+            return next_payload
+        source_url = str(candidate.get("url") or "").strip()
+        if source_url:
+            next_payload["source_url"] = source_url
+
+    if not source_url:
+        return next_payload
+
+    try:
+        details, page_description, _ = fc.get_page_payload(source_url, {})
+    except Exception as e:
+        logger.warning(f"Не удалось получить детали товара из '{source_url}': {e}")
+        return next_payload
+
+    detail_specs = bf.build_spec_updates(details)
+
+    def fill_if_missing(key, value):
+        value = str(value or "").strip()
+        if value and not str(next_payload.get(key) or "").strip():
+            next_payload[key] = value
+
+    fill_if_missing("brand", detect_brand_from_inputs(product_name, article))
+    fill_if_missing("weight", normalize_autofill_weight(bf.find_detail(details, *fc.WEIGHT_DETAIL_LABELS)))
+    fill_if_missing("model_no", bf.find_detail(details, *fc.MODEL_DETAIL_LABELS))
+    fill_if_missing("color", fc.detect_color(
+        {
+            "title": product_name,
+            "brand": next_payload.get("brand") or detect_brand_from_inputs(product_name, article),
+            "shorty_map": {},
+        },
+        details,
+    ))
+
+    for key in AUTOFILL_SPEC_KEYS:
+        fill_if_missing(key, detail_specs.get(key))
+
+    if page_description and not str(next_payload.get("description") or "").strip():
+        next_payload["description"] = finalize_description(
+            page_description,
+            next_payload.get("brand"),
+            product_name=product_name,
+        )
+
+    return next_payload
+
+SPEC_DUPLICATE_LABEL_TARGETS = {
+    "дисплей": ("display",),
+    "процессор": ("processor",),
+    "камера": ("camera",),
+    "фронтальная камера": ("front_camera",),
+    "видео": ("video",),
+    "связь": ("connectivity",),
+    "подключение": ("connectivity",),
+    "интерфейс": ("connectivity", "charging"),
+    "батарея": ("battery",),
+    "ос": ("os",),
+    "операционная система": ("os",),
+    "биометрия": ("biometrics",),
+    "зарядка": ("charging",),
+    "память": ("storage",),
+    "встроенная память": ("storage",),
+    "объем встроенной памяти": ("storage",),
+    "озу": ("ram",),
+    "ram": ("ram",),
+    "оперативная память": ("ram",),
+    "объем оперативной памяти": ("ram",),
+    "цвет": ("color",),
+    "бренд": ("brand",),
+    "производитель": ("brand",),
+    "страна": ("country",),
+    "страна производства": ("country",),
+    "страна-производитель": ("country",),
+    "вес": ("weight",),
+    "модель": ("model_number",),
+    "код производителя": ("model_number",),
+    "артикул": ("model_number",),
+    "гарантия": ("warranty",),
+}
+SPEC_ALWAYS_REDUNDANT_LABELS = {
+    "тип",
+    "тип товара",
+    "категория",
+}
+
+
+def get_product_field_value(product, key):
+    if product is None:
+        return ""
+    if isinstance(product, dict):
+        return product.get(key, "")
+    try:
+        return product[key]
+    except Exception:
+        return ""
+
+
+def normalize_spec_label_for_compare(value):
+    text = str(value or "").strip().rstrip(":").lower().replace("ё", "е")
+    text = text.replace("№", "").replace("(color)", "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_spec_value_for_compare(value):
+    text = str(value or "").strip().lower().replace("ё", "е")
+    replacements = {
+        "wi fi": "wi-fi",
+        "type c": "type-c",
+        "usb c": "usb-c",
+        "гб": "gb",
+        "тб": "tb",
+        "мпикс": "mp",
+        "мач": "mah",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    return re.sub(r"[^a-zа-я0-9]+", "", text)
+
+
+def normalize_weight_for_compare(value):
+    return normalize_autofill_weight(value)
+
+
+def are_duplicate_spec_values(label, left, right):
+    if not str(left or "").strip() or not str(right or "").strip():
+        return False
+    normalized_label = normalize_spec_label_for_compare(label)
+    if normalized_label == "вес":
+        return normalize_weight_for_compare(left) == normalize_weight_for_compare(right)
+    return normalize_spec_value_for_compare(left) == normalize_spec_value_for_compare(right)
+
+
+def sanitize_specs_payload(raw_value, product=None):
+    if isinstance(raw_value, dict):
+        parsed = {key: str(value).strip() for key, value in raw_value.items() if str(value).strip()}
+    else:
+        parsed = parse_specs_payload(raw_value)
+    if not parsed:
+        return {}
+
+    compare_values = {}
+    for key in AUTOFILL_SPEC_KEYS:
+        value = str(parsed.get(key) or "").strip()
+        if value:
+            compare_values[key] = value
+    for key in ("brand", "color", "country", "weight", "model_number", "storage", "ram", "warranty"):
+        value = str(get_product_field_value(product, key) or "").strip()
+        if value:
+            compare_values[key] = value
+
+    cleaned = {}
+    for key, value in parsed.items():
+        clean_key = str(key or "").strip()
+        clean_value = str(value or "").strip()
+        if not clean_key or not clean_value:
+            continue
+        if clean_key in AUTOFILL_SPEC_KEYS:
+            cleaned[clean_key] = clean_value
+            continue
+        normalized_label = normalize_spec_label_for_compare(clean_key)
+        if normalized_label in SPEC_ALWAYS_REDUNDANT_LABELS:
+            continue
+        duplicate_targets = SPEC_DUPLICATE_LABEL_TARGETS.get(normalized_label, ())
+        if any(are_duplicate_spec_values(normalized_label, clean_value, compare_values.get(target)) for target in duplicate_targets):
+            continue
+        cleaned[clean_key] = clean_value
+    return cleaned
+
+
+def parse_specs_payload(raw_value, product=None):
+    if isinstance(raw_value, dict):
+        parsed = {key: str(value).strip() for key, value in raw_value.items() if str(value).strip()}
+        return sanitize_specs_payload(parsed, product)
+    if not raw_value:
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    cleaned = {key: str(value).strip() for key, value in parsed.items() if str(value).strip()}
+    return sanitize_specs_payload(cleaned, product)
+
+
+def build_specs_payload_from_autofill(existing_specs, payload):
+    merged = dict(existing_specs or {})
+    for key in AUTOFILL_SPEC_KEYS:
+        value = str(payload.get(key, "") or "").strip()
+        if value:
+            merged[key] = value
+    return sanitize_specs_payload(merged, payload)
+
+
+def merge_synonyms(existing_synonyms, incoming_synonyms):
+    merged = []
+    seen = set()
+    for source in (incoming_synonyms or [], str(existing_synonyms or "").split(",")):
+        if isinstance(source, str):
+            candidates = [source]
+        else:
+            candidates = list(source or [])
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            key = value.lower()
+            if not value or key in seen:
+                continue
+            seen.add(key)
+            merged.append(value)
+    return ", ".join(merged)
+
+
+def build_autofill_cache_key(product_name, article=""):
+    raw = f"{str(product_name or '').strip().lower()}|{str(article or '').strip().lower()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_cached_autofill_payload(db, product_name, article=""):
+    cache_key = build_autofill_cache_key(product_name, article)
+    max_age = f"-{int(AUTOFILL_CACHE_MAX_AGE_DAYS)} days"
+    row = db.execute(
+        """
+        SELECT payload
+        FROM ai_autofill_cache
+        WHERE cache_key = ?
+          AND updated_at >= datetime('now', ?)
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (cache_key, max_age),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload["synonyms"] = payload.get("synonyms") or []
+    return payload
+
+
+def save_autofill_cache(db, user_id, product_name, article, payload):
+    cache_key = build_autofill_cache_key(product_name, article)
+    serialized_payload = json.dumps(payload, ensure_ascii=False)
+    existing = db.execute(
+        "SELECT id FROM ai_autofill_cache WHERE cache_key = ?",
+        (cache_key,),
+    ).fetchone()
+    if existing:
+        db.execute(
+            """
+            UPDATE ai_autofill_cache
+            SET user_id = ?, product_name = ?, article = ?, payload = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (user_id, product_name, article, serialized_payload, existing["id"]),
+        )
+    else:
+        db.execute(
+            """
+            INSERT INTO ai_autofill_cache (cache_key, user_id, product_name, article, payload)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (cache_key, user_id, product_name, article, serialized_payload),
+        )
+
+
+def payload_improves_product(product_row, payload):
+    product = dict(product_row or {})
+    comparisons = (
+        ("brand", sanitize_brand_value(product.get("brand")), sanitize_brand_value(payload.get("brand"))),
+        ("country", str(product.get("country") or "").strip(), str(payload.get("country_sim") or "").strip()),
+        ("weight", str(product.get("weight") or "").strip(), str(payload.get("weight") or "").strip()),
+        ("model_number", normalize_model_no(product.get("model_number"), sanitize_brand_value(product.get("brand"))), normalize_model_no(payload.get("model_no"), sanitize_brand_value(payload.get("brand")))),
+        ("color", str(product.get("color") or "").strip(), str(payload.get("color") or "").strip()),
+        ("storage", str(product.get("storage") or "").strip(), str(payload.get("storage") or "").strip()),
+        ("ram", str(product.get("ram") or "").strip(), str(payload.get("ram") or "").strip()),
+        ("warranty", str(product.get("warranty") or "").strip(), str(payload.get("warranty") or "").strip()),
+        ("description", strip_description_notes(product.get("description")), strip_description_notes(payload.get("description"))),
+    )
+    for _, current_value, next_value in comparisons:
+        if next_value and next_value != current_value:
+            return True
+
+    existing_specs = parse_specs_payload(product.get("specs"))
+    for key in AUTOFILL_SPEC_KEYS:
+        next_value = str(payload.get(key) or "").strip()
+        current_value = str(existing_specs.get(key) or "").strip()
+        if next_value and next_value != current_value:
+            return True
+
+    existing_synonyms = {str(item or "").strip().lower() for item in str(product.get("synonyms") or "").split(",") if str(item or "").strip()}
+    for synonym in payload.get("synonyms", []):
+        normalized = str(synonym or "").strip().lower()
+        if normalized and normalized not in existing_synonyms:
+            return True
+    return False
+
+
+def upsert_product_from_autofill(db, user_id, product_row, payload, preferred_folder_id=None):
+    product = dict(product_row)
+    resolved_folder_id = resolve_product_folder_assignment(
+        db,
+        user_id,
+        product.get("name", ""),
+        preferred_folder_id if preferred_folder_id is not None else product.get("folder_id"),
+        payload.get("storage") or product.get("storage"),
+    )
+    merged_specs = build_specs_payload_from_autofill(parse_specs_payload(product.get("specs")), payload)
+    merged_synonyms = merge_synonyms(product.get("synonyms"), payload.get("synonyms", []))
+    resolved_brand = sanitize_brand_value(payload.get("brand")) or sanitize_brand_value(product.get("brand"))
+    resolved_country = (
+        payload.get("country_sim")
+        or product.get("country")
+        or infer_brand_country_fallback(resolved_brand)
+        or infer_accessory_country_fallback(product.get("name", ""), resolved_brand)
+    )
+    resolved_model_no = normalize_model_no(payload.get("model_no"), resolved_brand)
+    if not resolved_model_no:
+        resolved_model_no = normalize_model_no(product.get("model_number"), sanitize_brand_value(product.get("brand")))
+    resolved_warranty = str(payload.get("warranty") or product.get("warranty") or STORE_WARRANTY_DEFAULT).strip()
+    if resolved_warranty in {"Гарантия CMstore", "Гарантия от Магазина", "Гарантия от магазина", "Гарантия от магазина 1 год."}:
+        resolved_warranty = STORE_WARRANTY_DEFAULT
+    db.execute(
+        """
+        UPDATE products
+        SET brand = ?, country = ?, weight = ?, model_number = ?, folder_id = ?,
+            color = ?, storage = ?, ram = ?, warranty = ?, description = ?, specs = ?, synonyms = ?, source_url = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (
+            resolved_brand,
+            resolved_country,
+            payload.get("weight") or product.get("weight"),
+            resolved_model_no,
+            resolved_folder_id,
+            payload.get("color") or product.get("color"),
+            payload.get("storage") or product.get("storage"),
+            payload.get("ram") or product.get("ram"),
+            resolved_warranty,
+            payload.get("description") or product.get("description"),
+            json.dumps(merged_specs, ensure_ascii=False) if merged_specs else "",
+            merged_synonyms,
+            payload.get("source_url") or product.get("source_url"),
+            product["id"],
+            user_id,
+        ),
+    )
+    return resolved_folder_id
+
+
+def is_retryable_ai_error(error):
+    text = str(error or "").lower()
+    retry_markers = (
+        "429",
+        "503",
+        "quota",
+        "resource_exhausted",
+        "rate limit",
+        "high demand",
+        "unavailable",
+        "temporarily unavailable",
+    )
+    return any(marker in text for marker in retry_markers)
+
+
+def compute_ai_retry_delay_seconds(attempts):
+    if attempts <= 1:
+        return 5 * 60
+    if attempts == 2:
+        return 15 * 60
+    if attempts == 3:
+        return 30 * 60
+    return 60 * 60
+
+
+def enqueue_ai_repair_job(db, user_id, product_id, product_name, article="", preferred_folder_id=None, last_error=""):
+    existing = db.execute(
+        """
+        SELECT id, attempts
+        FROM ai_repair_jobs
+        WHERE user_id = ? AND product_id = ? AND status IN ('pending', 'processing', 'retry_wait')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id, product_id),
+    ).fetchone()
+    if existing:
+        db.execute(
+            """
+            UPDATE ai_repair_jobs
+            SET product_name = ?, article = ?, preferred_folder_id = ?, status = 'retry_wait',
+                last_error = ?, next_retry_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (product_name, article, normalize_folder_id(preferred_folder_id), str(last_error or "")[:1000], existing["id"]),
+        )
+        return int(existing["id"])
+    cursor = db.execute(
+        """
+        INSERT INTO ai_repair_jobs (
+            user_id, product_id, product_name, article, preferred_folder_id,
+            status, attempts, next_retry_at, last_error
+        ) VALUES (?, ?, ?, ?, ?, 'retry_wait', 0, CURRENT_TIMESTAMP, ?)
+        """,
+        (
+            user_id,
+            product_id,
+            product_name,
+            article,
+            normalize_folder_id(preferred_folder_id),
+            str(last_error or "")[:1000],
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def normalize_autofill_payload(product_name, parsed_data, article=""):
+    payload = {key: str(parsed_data.get(key, "") or "").strip() for key in AUTOFILL_RESPONSE_KEYS}
+    payload["source_url"] = str(parsed_data.get("source_url", "") or "").strip()
+    detected_brand = sanitize_brand_value(detect_brand_from_inputs(product_name, article))
+    payload["brand"] = sanitize_brand_value(payload["brand"]) or detected_brand
+    article_model_no = extract_apple_model_no(article) or extract_apple_model_no(product_name)
+    if payload["brand"] == "Apple" and article_model_no:
+        payload["model_no"] = article_model_no
+    payload["country_sim"] = (
+        detect_country_variant(product_name)
+        or payload["country_sim"]
+        or infer_brand_country_fallback(payload["brand"])
+        or infer_accessory_country_fallback(product_name, payload["brand"])
+    )
+    payload["weight"] = normalize_autofill_weight(payload["weight"])
+    if is_apple_iphone_product(product_name, payload["brand"]):
+        payload["weight"] = infer_iphone_weight_from_name(product_name) or payload["weight"]
+        payload["os"] = normalize_iphone_os_value(payload["os"], product_name, payload["brand"])
+    elif not payload["os"]:
+        payload["os"] = infer_basic_os(product_name, payload["brand"])
+    inferred_ram, inferred_storage = extract_ram_storage_from_name(product_name)
+    if inferred_storage and not payload["storage"]:
+        payload["storage"] = inferred_storage
+    if inferred_ram and not payload["ram"]:
+        payload["ram"] = inferred_ram
+    payload["storage"] = normalize_capacity(payload["storage"], allow_tb=True)
+    payload["ram"] = normalize_capacity(payload["ram"], allow_tb=False)
+    payload["model_no"] = normalize_model_no(payload["model_no"], payload["brand"])
+    if payload["warranty"] in {"Гарантия CMstore", "Гарантия от Магазина", "Гарантия от магазина", "Гарантия от магазина 1 год."}:
+        payload["warranty"] = STORE_WARRANTY_DEFAULT
+    payload["warranty"] = payload["warranty"] or STORE_WARRANTY_DEFAULT
+    payload["description"] = finalize_description(
+        payload["description"],
+        payload["brand"],
+        product_name=product_name,
+    )
+    payload["synonyms"] = build_synonyms(product_name, payload["brand"], article)
+    return payload
+
+
+def get_or_generate_autofill_payload(db, user_id, product_name, article="", use_cache=True):
+    if use_cache:
+        cached_payload = get_cached_autofill_payload(db, product_name, article)
+        if cached_payload:
+            return cached_payload, "cache"
+    if not GEMINI_API_KEY:
+        return build_offline_autofill_payload(product_name, article), "offline"
+    result_text = call_gemini_online(build_autofill_prompt(product_name, article))
+    payload = normalize_autofill_payload(product_name, parse_autofill_json(result_text), article)
+    payload = normalize_autofill_payload(
+        product_name,
+        supplement_autofill_payload_from_known_products(product_name, article, payload),
+        article,
+    )
+    payload = normalize_autofill_payload(
+        product_name,
+        supplement_autofill_payload_from_catalog(product_name, article, payload),
+        article,
+    )
+    save_autofill_cache(db, user_id, product_name, article, payload)
+    return payload, "live"
+
+
+@app.route('/api/autofill', methods=['POST'])
+def autofill():
+    db = get_db()
+    data = request.json or {}
+    product_name = data.get('name', '').strip()
+    article = data.get('article', '').strip()
+    use_cache = not bool(data.get('force_online'))
+
+    if not product_name:
+        return jsonify({"error": "No product name"}), 400
+
+    try:
+        payload, source = get_or_generate_autofill_payload(db, 0, product_name, article, use_cache=use_cache)
+        db.commit()
+        return jsonify({**payload, "_source": source})
     except Exception as e:
         print("Ошибка Gemini:", str(e))
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)}), 503
+
+
+@app.route('/api/products/<int:prod_id>/repair_with_ai', methods=['POST'])
+@login_required
+def repair_product_with_ai(prod_id):
+    user_id = session['user_id']
+    db = get_db()
+    product_row = db.execute(
+        "SELECT * FROM products WHERE id = ? AND user_id = ?",
+        (prod_id, user_id),
+    ).fetchone()
+    if not product_row:
+        return jsonify({"error": "Товар не найден"}), 404
+
+    data = request.get_json(silent=True) or {}
+    product = dict(product_row)
+    product_name = str(data.get("name") or product.get("name") or "").strip()
+    article = str(data.get("article") or product.get("model_number") or "").strip()
+    preferred_folder_id = normalize_folder_id(data.get("folder_id"))
+
+    if not product_name:
+        return jsonify({"error": "У товара нет названия"}), 400
+
+    try:
+        payload, source = get_or_generate_autofill_payload(db, user_id, product_name, article, use_cache=True)
+        if source == "cache" and not payload_improves_product(product_row, payload):
+            payload, source = get_or_generate_autofill_payload(db, user_id, product_name, article, use_cache=False)
+        if not payload_improves_product(product_row, payload):
+            return jsonify({
+                "success": False,
+                "queued": False,
+                "message": "Не удалось подтвердить новые данные для этой карточки. Нужен более точный источник или ручная проверка.",
+            }), 200
+        resolved_folder_id = upsert_product_from_autofill(
+            db,
+            user_id,
+            product_row,
+            payload,
+            preferred_folder_id if preferred_folder_id is not None else product.get("folder_id"),
+        )
+        db.commit()
+        notify_clients()
+        variant_folder_name = detect_variant_folder_name(product_name)
+        folder_message = f"Папка: {variant_folder_name}" if variant_folder_name else "Папка не менялась"
+        return jsonify({
+            "success": True,
+            "queued": False,
+            "folder_id": resolved_folder_id,
+            "message": f"Карточка исправлена. {folder_message}. Источник: {'кэш' if source == 'cache' else 'онлайн'}",
+        })
+    except Exception as e:
+        if is_retryable_ai_error(e):
+            job_id = enqueue_ai_repair_job(
+                db,
+                user_id,
+                prod_id,
+                product_name,
+                article,
+                preferred_folder_id if preferred_folder_id is not None else product.get("folder_id"),
+                last_error=e,
+            )
+            db.commit()
+            notify_clients()
+            return jsonify({
+                "success": False,
+                "queued": True,
+                "job_id": job_id,
+                "message": "Лимит или временная недоступность AI. Карточка поставлена в очередь и будет доисправлена автоматически.",
+            }), 202
+        logger.error(f"Ошибка AI-исправления товара {prod_id}: {e}")
+        return jsonify({"error": str(e)}), 503
 
 
 
@@ -636,6 +2975,7 @@ def confirm_product_message():
             VALUES (?, ?, ?, 'confirmed', ?)
             ON CONFLICT(product_id, message_id, line_index) DO UPDATE SET status='confirmed', extracted_price=excluded.extracted_price
         """, (data['product_id'], data['message_id'], line_idx, price))
+        maybe_sync_product_sort_from_message(db, session['user_id'], data['product_id'], data['message_id'], line_idx)
         db.commit()
         notify_clients()
          
@@ -682,31 +3022,1716 @@ def clean_for_search(text):
     t = t.translate(str.maketrans('асеокрх', 'aceokpx'))
     return set(t.split())
 
+
+PRODUCT_SEARCH_ALIAS_GROUPS = [
+    ['геймпад', 'гейм пад', 'геймад', 'джойстик', 'джой', 'джостик', 'контроллер', 'controller', 'gamepad', 'game pad', 'joystick'],
+    ['наушники', 'наушник', 'гарнитура', 'гарнитуры', 'headset', 'headsets', 'headphones', 'headphone', 'earbuds', 'earphones'],
+    ['эйрподс', 'аирподс', 'airpods', 'air pods'],
+    ['колонка', 'колонки', 'акустика', 'акустическая система', 'спикер', 'speaker', 'speakers'],
+    ['зарядка', 'зарядки', 'зарядное', 'зарядное устройство', 'зарядник', 'сзу', 'charger', 'charging', 'power adapter', 'адаптер питания', 'блок питания'],
+    ['кабель', 'кабели', 'шнур', 'провод', 'cable', 'cord', 'wire'],
+    ['чехол', 'чехлы', 'кейс', 'кейсы', 'накладка', 'бампер', 'case', 'cover', 'sleeve'],
+    ['пленка', 'пленки', 'плёнка', 'плёнки', 'стекло', 'стекла', 'стекло защитное', 'защитное стекло', 'glass', 'film'],
+    ['ноутбук', 'ноутбуки', 'ноут', 'лэптоп', 'лаптоп', 'laptop', 'notebook'],
+    ['макбук', 'мак', 'macbook', 'mac'],
+    ['смартфон', 'смартфоны', 'телефон', 'телефоны', 'мобильник', 'phone', 'smartphone'],
+    ['айфон', 'айфоны', 'iphone'],
+    ['pro', 'про'],
+    ['max', 'макс', 'мах'],
+    ['plus', 'плюс'],
+    ['ultra', 'ультра'],
+    ['mini', 'мини'],
+    ['air', 'эйр', 'аир'],
+    ['планшет', 'планшеты', 'tablet'],
+    ['айпад', 'айпеды', 'ipad'],
+    ['часы', 'часики', 'умные часы', 'смарт часы', 'смарт-часы', 'smartwatch', 'watch'],
+    ['монитор', 'мониторы', 'display', 'screen', 'экран'],
+    ['мышь', 'мышка', 'мышки', 'mouse'],
+    ['клавиатура', 'клава', 'keyboard'],
+    ['роутер', 'роутеры', 'маршрутизатор', 'маршрутизаторы', 'router'],
+    ['адаптер', 'адаптеры', 'переходник', 'переходники', 'adapter', 'hub', 'usb hub'],
+    ['пауэрбанк', 'повербанк', 'powerbank', 'power bank', 'внешний аккумулятор', 'внешний аккум', 'аккум', 'акб'],
+    ['dualsense', 'dual sense', 'dual-sense', 'дуалсенс', 'дуал сенс', 'дуал-сенс'],
+    ['joycon', 'joy con', 'joy-con', 'джойкон', 'джой кон', 'джой- кон'],
+    ['vr', 'виртуальная реальность', 'шлем', 'очки', 'гарнитура vr', 'vision pro'],
+    ['камера', 'экшн камера', 'экшн-камера', 'action camera', 'gopro'],
+    ['apple', 'эпл', 'эппл'],
+    ['samsung', 'самсунг', 'самс', 'galaxy', 'галакси'],
+    ['xiaomi', 'сяоми', 'ксиаоми', 'mi', 'redmi', 'редми', 'poco', 'поко'],
+    ['huawei', 'хуавей'],
+    ['honor', 'хонор'],
+    ['dyson', 'дайсон'],
+    ['sony', 'сони'],
+    ['asus', 'асус'],
+    ['lenovo', 'леново'],
+    ['hp', 'хп', 'эйчпи'],
+    ['nintendo', 'нинтендо', 'switch', 'свитч'],
+    ['playstation', 'play station', 'плейстейшен', 'плейстейшн', 'плойка', 'сонька', 'ps', 'ps4', 'ps5', 'пс4', 'пс5'],
+    ['xbox', 'x box', 'иксбокс'],
+    ['steam deck', 'steamdeck', 'стим дек', 'стимдек'],
+    ['type c', 'type-c', 'typec', 'usb c', 'usb-c', 'usbc', 'тайп си', 'тайпси', 'юсб си', 'юсбси'],
+]
+
+PRODUCT_SEARCH_STOP_WORDS = {
+    'для', 'на', 'под', 'к', 'ко', 'от', 'с', 'со', 'из', 'у', 'в', 'во', 'по', 'and', 'the', 'for', 'with', 'of'
+}
+
+PRODUCT_SEARCH_NORMALIZATION_REPLACEMENTS = [
+    (re.compile(r"\b(?:steam|стим)\s*deck\b", re.IGNORECASE), 'steamdeck'),
+    (re.compile(r"\bстим\s*дек\b", re.IGNORECASE), 'steamdeck'),
+    (re.compile(r"\b(?:type|тайп)\s*-?\s*(?:c|си)\b", re.IGNORECASE), 'typec'),
+    (re.compile(r"\b(?:usb|юсб)\s*-?\s*(?:c|си)\b", re.IGNORECASE), 'usbc'),
+    (re.compile(r"\bplay\s+station\b", re.IGNORECASE), 'playstation'),
+    (re.compile(r"\bплей\s*стейш[её]н\b", re.IGNORECASE), 'плейстейшн'),
+    (re.compile(r"\bdual[\s-]+sense\b", re.IGNORECASE), 'dualsense'),
+    (re.compile(r"\bдуал[\s-]*сенс\b", re.IGNORECASE), 'дуалсенс'),
+    (re.compile(r"\bjoy[\s-]*con\b", re.IGNORECASE), 'joycon'),
+    (re.compile(r"\bair[\s-]*pods\b", re.IGNORECASE), 'airpods'),
+    (re.compile(r"\bpower\s+bank\b", re.IGNORECASE), 'powerbank'),
+    (re.compile(r"\bgame\s+pad\b", re.IGNORECASE), 'gamepad'),
+    (re.compile(r"\bsmart[\s-]*watch\b", re.IGNORECASE), 'smartwatch'),
+    (re.compile(r"\be\s*sim\b", re.IGNORECASE), 'esim'),
+    (re.compile(r"\bps\s+([45])\b", re.IGNORECASE), r'ps\1'),
+    (re.compile(r"\bпс\s+([45])\b", re.IGNORECASE), r'пс\1'),
+    (re.compile(r"\b(?:playstation|плейстейшн|плейстейшен|плойка|сонька)\s*([45])\b", re.IGNORECASE), r'ps\1'),
+]
+
+PRODUCT_ACCESSORY_SEARCH_HINTS = [
+    'аксессуар', 'аксессуары', 'чехол', 'чехлы', 'кейс', 'кейсы', 'бампер', 'накладка', 'накладки',
+    'ремешок', 'ремешки', 'браслет', 'браслеты', 'стекло', 'пленка', 'пленки', 'зарядка', 'зарядное',
+    'кабель', 'кабели', 'адаптер', 'адаптеры', 'переходник', 'переходники', 'док станция', 'dock',
+    'станция', 'держатель', 'holder', 'mount', 'cover', 'strap', 'charger', 'cable',
+    'ssd', 'накопитель', 'дисковод', 'панель', 'панели', 'игра', 'игры', 'game', 'subscription', 'подписка'
+]
+
+PRODUCT_COMMON_STORAGE_NUMBERS = {'32', '64', '128', '256', '512', '1024', '2048'}
+
+PRODUCT_SQL_LITERAL_SEARCH_EXPANSIONS = {
+    'steamdeck': ['Steam Deck', 'steam deck'],
+    'applewatch': ['Watch', 'Apple Watch', 'apple watch'],
+    'typec': ['Type-C', 'Type C', 'type-c', 'type c'],
+    'usbc': ['USB-C', 'USB C', 'usb-c', 'usb c'],
+}
+
+RU_TO_EN_KEYBOARD = str.maketrans({
+    'й': 'q', 'ц': 'w', 'у': 'e', 'к': 'r', 'е': 't', 'н': 'y', 'г': 'u', 'ш': 'i', 'щ': 'o', 'з': 'p', 'х': 'h', 'ъ': '',
+    'ф': 'a', 'ы': 's', 'в': 'd', 'а': 'f', 'п': 'g', 'р': 'h', 'о': 'j', 'л': 'k', 'д': 'l', 'ж': '', 'э': '',
+    'я': 'z', 'ч': 'x', 'с': 'c', 'м': 'v', 'и': 'b', 'т': 'n', 'ь': 'm', 'б': '', 'ю': '',
+})
+EN_TO_RU_KEYBOARD = str.maketrans({
+    'q': 'й', 'w': 'ц', 'e': 'у', 'r': 'к', 't': 'е', 'y': 'н', 'u': 'г', 'i': 'ш', 'o': 'щ', 'p': 'з',
+    'a': 'ф', 's': 'ы', 'd': 'в', 'f': 'а', 'g': 'п', 'h': 'р', 'j': 'о', 'k': 'л', 'l': 'д',
+    'z': 'я', 'x': 'ч', 'c': 'с', 'v': 'м', 'b': 'и', 'n': 'т', 'm': 'ь',
+})
+
+
+def normalize_product_search_text(value):
+    normalized = str(value or '').lower().replace('ё', 'е')
+    normalized = re.sub(r'[+"\'`«»]', ' ', normalized)
+    normalized = re.sub(r'[\u2010-\u2015]', '-', normalized)
+    for pattern, replacement in PRODUCT_SEARCH_NORMALIZATION_REPLACEMENTS:
+        normalized = pattern.sub(replacement, normalized)
+    normalized = re.sub(r'[^a-zа-я0-9]+', ' ', normalized)
+    return re.sub(r'\s+', ' ', normalized).strip()
+
+
+def keyboard_layout_variants(value):
+    normalized = normalize_product_search_text(value)
+    if not normalized:
+        return []
+    variants = []
+    if re.search(r'[а-я]', normalized):
+        variants.append(normalize_product_search_text(normalized.translate(RU_TO_EN_KEYBOARD)))
+    if re.search(r'[a-z]', normalized):
+        variants.append(normalize_product_search_text(normalized.translate(EN_TO_RU_KEYBOARD)))
+    return [variant for variant in variants if variant and variant != normalized]
+
+
+def tokenize_product_search_query(value, keep_stop_words=False):
+    normalized = normalize_product_search_text(value)
+    if not normalized:
+        return []
+    words = [word for word in normalized.split() if word]
+    if keep_stop_words:
+        return words
+    meaningful = [word for word in words if word not in PRODUCT_SEARCH_STOP_WORDS]
+    return meaningful or words
+
+
+def should_expand_alias_group_by_term(source_term, alias_term):
+    normalized_source = normalize_product_search_text(source_term)
+    normalized_alias = normalize_product_search_text(alias_term)
+    if not normalized_source or not normalized_alias:
+        return False
+    if normalized_source == normalized_alias:
+        return True
+    return len(normalized_source) >= 3 and normalized_alias.startswith(normalized_source)
+
+
+PRODUCT_SEARCH_ALIAS_INDEX = {}
+for alias_group in PRODUCT_SEARCH_ALIAS_GROUPS:
+    normalized_group = [normalize_product_search_text(item) for item in alias_group]
+    normalized_group = [item for item in normalized_group if item]
+    for item in normalized_group:
+        PRODUCT_SEARCH_ALIAS_INDEX[item] = normalized_group
+
+
+def collect_product_search_terms(value):
+    normalized = normalize_product_search_text(value)
+    if not normalized:
+        return []
+
+    layout_variants = keyboard_layout_variants(normalized)
+    result = {normalized, normalized.replace(' ', ''), *layout_variants}
+    result.update(variant.replace(' ', '') for variant in layout_variants)
+    words = [word for word in normalized.split() if word]
+    alias_candidates = list(dict.fromkeys([normalized, *layout_variants, *words]))
+
+    canonical_units = {
+        'мм': ['мм', 'mm', 'м'],
+        'mm': ['мм', 'mm', 'м'],
+        'м': ['мм', 'mm', 'м'],
+        'gb': ['gb', 'гб'],
+        'гб': ['gb', 'гб'],
+        'tb': ['tb', 'тб'],
+        'тб': ['tb', 'тб'],
+        'hz': ['hz', 'гц'],
+        'гц': ['hz', 'гц'],
+        'mah': ['mah', 'мач'],
+        'мач': ['mah', 'мач'],
+        'вт': ['вт', 'w'],
+        'w': ['вт', 'w'],
+    }
+
+    for word in [*words, *layout_variants]:
+        result.add(word)
+
+        if len(word) > 4 and word.endswith(('ы', 'и')):
+            result.add(word[:-1])
+        if len(word) > 5 and word.endswith(('а', 'е', 'о', 'у', 'я')):
+            result.add(word[:-1])
+
+        compact_unit_match = re.match(r'^(\d+)(мм|mm|м|gb|гб|tb|тб|hz|гц|mah|мач|вт|w)$', word, re.IGNORECASE)
+        if compact_unit_match:
+            numeric_value = compact_unit_match.group(1)
+            raw_unit = compact_unit_match.group(2).lower()
+            result.add(numeric_value)
+            for unit in canonical_units.get(raw_unit, [raw_unit]):
+                result.add(f'{numeric_value}{unit}')
+                result.add(f'{numeric_value} {unit}')
+
+        for alias in PRODUCT_SEARCH_ALIAS_INDEX.get(word, []):
+            result.add(alias)
+
+    for alias_group in PRODUCT_SEARCH_ALIAS_GROUPS:
+        if any(should_expand_alias_group_by_term(candidate, item) for candidate in alias_candidates for item in alias_group):
+            for item in alias_group:
+                normalized_item = normalize_product_search_text(item)
+                if normalized_item:
+                    result.add(normalized_item)
+
+    return [item for item in result if item]
+
+
+def build_derived_product_search_aliases(product):
+    combined = normalize_product_search_text(' '.join([
+        str(product.get('name') or ''),
+        str(product.get('brand') or ''),
+        str(product.get('model_number') or ''),
+        str(product.get('synonyms') or ''),
+    ]))
+
+    aliases = set()
+    is_gamepad = bool(re.search(r'(геймпад|джойстик|контроллер|controller|gamepad|joystick|dualsense|joycon)', combined))
+    is_playstation = bool(re.search(r'(ps5|ps4|playstation|плейстейшн|пс5|пс4|плойка|сонька)', combined))
+    is_xbox = bool(re.search(r'(xbox|иксбокс)', combined))
+    is_switch = bool(re.search(r'(switch|nintendo|нинтендо|joycon)', combined))
+
+    if 'dualsense' in combined or (is_gamepad and is_playstation):
+        aliases.update({
+            'джойстик для ps5',
+            'джой для ps5',
+            'геймпад для ps5',
+            'контроллер ps5',
+            'джойстик для плойки',
+            'геймпад для playstation',
+            'sony dualsense',
+            'dual sense',
+            'дуал сенс',
+        })
+
+    if is_gamepad and is_xbox:
+        aliases.update({
+            'джойстик xbox',
+            'геймпад xbox',
+            'контроллер xbox',
+            'xbox controller',
+        })
+
+    if ('joycon' in combined or 'joy con' in combined) and is_switch:
+        aliases.update({
+            'джойкон',
+            'джойстик для switch',
+            'геймпад для nintendo switch',
+            'joy-con',
+        })
+    elif is_gamepad and is_switch:
+        aliases.update({
+            'джойстик для switch',
+            'геймпад switch',
+            'контроллер nintendo switch',
+        })
+
+    if 'airpods' in combined:
+        aliases.update({
+            'беспроводные наушники apple',
+            'наушники для iphone',
+            'air pods',
+        })
+
+    if re.search(r'(powerbank|пауэрбанк|повербанк|внешний аккумулятор|magnetic wireless charging)', combined):
+        aliases.update({
+            'power bank',
+            'внешний аккум',
+            'пауэрбанк',
+            'повербанк',
+        })
+
+    return list(aliases)
+
+
+def bounded_levenshtein_distance(left, right, max_distance):
+    if left == right:
+        return 0
+    if abs(len(left) - len(right)) > max_distance:
+        return max_distance + 1
+
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, 1):
+        current = [left_index]
+        row_min = current[0]
+        for right_index, right_char in enumerate(right, 1):
+            cost = 0 if left_char == right_char else 1
+            value = min(
+                previous[right_index] + 1,
+                current[right_index - 1] + 1,
+                previous[right_index - 1] + cost,
+            )
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > max_distance:
+            return max_distance + 1
+        previous = current
+    return previous[-1]
+
+
+def is_product_search_typo_match(token, variant):
+    if token.isdigit() or variant.isdigit():
+        return False
+    if len(token) < 4 or len(variant) < 4 or len(token) > 24 or len(variant) > 24:
+        return False
+    if token[0] != variant[0]:
+        return False
+    shorter_len = min(len(token), len(variant))
+    max_typos = 1 if shorter_len < 8 else 2
+    return bounded_levenshtein_distance(token, variant, max_typos) <= max_typos
+
+
+def build_product_search_typo_keys(value):
+    normalized = normalize_product_search_text(value).replace(' ', '')
+    if len(normalized) < 4 or len(normalized) > 24 or normalized.isdigit():
+        return []
+    keys = {normalized}
+    for index in range(len(normalized)):
+        keys.add(normalized[:index] + normalized[index + 1:])
+    return list(keys)
+
+
+def token_matches_product_search_variant(token, variant):
+    normalized_token = normalize_product_search_text(token)
+    normalized_variant = normalize_product_search_text(variant)
+    if not normalized_token or not normalized_variant:
+        return False
+    if re.fullmatch(r'\d+', normalized_variant):
+        if re.fullmatch(r'\d+', normalized_token):
+            return normalized_token == normalized_variant
+        if normalized_token.endswith(normalized_variant) and len(normalized_token) <= len(normalized_variant) + 1:
+            return True
+        return False
+    if normalized_token == normalized_variant:
+        return True
+    if normalized_token in PRODUCT_SEARCH_STOP_WORDS:
+        return False
+    if len(normalized_token) < 2 or len(normalized_variant) < 2:
+        return False
+    return (
+        normalized_token.startswith(normalized_variant)
+        or normalized_token in normalized_variant
+        or normalized_variant in normalized_token
+        or is_product_search_typo_match(normalized_token, normalized_variant)
+    )
+
+
+def token_list_matches_product_search_variant(token_list, variant):
+    normalized_variant = normalize_product_search_text(variant)
+    if not normalized_variant:
+        return False
+    return any(token_matches_product_search_variant(token, normalized_variant) for token in (token_list or []))
+
+
+def search_text_matches_variant(text, variant):
+    normalized_text = normalize_product_search_text(text)
+    normalized_variant = normalize_product_search_text(variant)
+    if not normalized_variant:
+        return False
+    if re.fullmatch(r'\d+', normalized_variant):
+        return any(token_matches_product_search_variant(token, normalized_variant) for token in normalized_text.split())
+    haystack = f' {normalized_text} '
+    if f' {normalized_variant} ' in haystack:
+        return True
+    if token_list_matches_product_search_variant(normalized_text.split(), normalized_variant):
+        return True
+    return normalized_variant in haystack
+
+
+def has_explicit_storage_query_intent(words):
+    return any(re.match(r'^(?:\d+\s*(?:gb|tb|гб|тб)|\d+(?:gb|tb|гб|тб)|gb|tb|гб|тб)$', normalize_product_search_text(word)) for word in (words or []))
+
+
+def extract_product_search_numbers(value):
+    normalized = normalize_product_search_text(value)
+    return list(dict.fromkeys(re.findall(r'\b\d+\b', normalized)))
+
+
+def extract_storage_search_numbers(*values):
+    numbers = []
+    seen = set()
+    for value in values:
+        normalized = normalize_product_search_text(value)
+        for match in re.finditer(r'\b(\d+)\s*(gb|tb|гб|тб)\b', normalized):
+            number = match.group(1)
+            if number and number not in seen:
+                seen.add(number)
+                numbers.append(number)
+    return numbers
+
+
+def is_accessory_search_intent(words):
+    for word in (words or []):
+        variants = collect_product_search_terms(word)
+        if any(hint in variant for variant in variants for hint in PRODUCT_ACCESSORY_SEARCH_HINTS):
+            return True
+    return False
+
+
+def is_gamepad_search_intent(words):
+    hints = {
+        'геймпад', 'джойстик', 'джой', 'контроллер', 'controller', 'gamepad',
+        'joystick', 'dualsense', 'dual sense', 'joycon', 'joy con', 'джойкон'
+    }
+    for word in (words or []):
+        variants = collect_product_search_terms(word)
+        if any(hint in variant for variant in variants for hint in hints):
+            return True
+    return False
+
+
+def looks_like_device_model_query(words):
+    normalized_words = [normalize_product_search_text(word) for word in (words or []) if normalize_product_search_text(word)]
+    if not normalized_words:
+        return False
+
+    device_brands = {
+        'iphone', 'айфон', 'apple', 'galaxy', 'samsung', 'xiaomi', 'redmi',
+        'poco', 'honor', 'huawei', 'oneplus', 'pixel', 'realme'
+    }
+    device_modifiers = {'pro', 'max', 'plus', 'mini', 'ultra'}
+    numeric_words = [word for word in normalized_words if re.fullmatch(r'\d+', word)]
+
+    return (
+        any(word in device_brands for word in normalized_words)
+        or any(word in device_modifiers for word in normalized_words)
+        or (len(numeric_words) == 1 and len(normalized_words) >= 2)
+    )
+
+
+def get_product_search_sort_tuple(entry):
+    sort_index = entry.get('sort_index')
+    sort_bucket = 1 if sort_index is None else 0
+    sort_value = sort_index if sort_index is not None else 0
+    display_name = str(entry.get('display_name') or '')
+    return (sort_bucket, sort_value, display_name.lower(), int(entry.get('id') or 0))
+
+
+def build_search_token_set(*values):
+    tokens = []
+    seen = set()
+    for value in values:
+        normalized = normalize_product_search_text(value)
+        for token in normalized.split():
+            if not token or token in PRODUCT_SEARCH_STOP_WORDS:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+    return frozenset(tokens)
+
+
+def build_compound_product_search_terms(chunks):
+    compounds = []
+    seen = set()
+    for chunk in chunks:
+        words = [
+            word
+            for word in normalize_product_search_text(chunk).split()
+            if len(word) >= 2 and word not in PRODUCT_SEARCH_STOP_WORDS
+        ]
+        for size in (2, 3):
+            if len(words) < size:
+                continue
+            for index in range(0, len(words) - size + 1):
+                compound = ''.join(words[index:index + size])
+                if len(compound) < 4 or len(compound) > 36 or compound in seen:
+                    continue
+                seen.add(compound)
+                compounds.append(compound)
+    return compounds
+
+
+def build_server_product_search_entry(product_row):
+    product = dict(product_row)
+    derived_aliases = build_derived_product_search_aliases(product)
+    combined_search_source = normalize_product_search_text(' '.join([
+        str(product.get('name') or ''),
+        str(product.get('brand') or ''),
+        str(product.get('model_number') or ''),
+        str(product.get('synonyms') or ''),
+        ' '.join(derived_aliases),
+    ]))
+    normalized_chunks = [
+        normalize_product_search_text(chunk)
+        for chunk in (
+            product.get('name'),
+            product.get('brand'),
+            product.get('model_number'),
+            product.get('country'),
+            product.get('storage'),
+            product.get('color'),
+            product.get('synonyms'),
+            ' '.join(derived_aliases),
+        )
+        if chunk
+    ]
+    compound_chunks = build_compound_product_search_terms(normalized_chunks)
+    compact_chunks = [
+        chunk.replace(' ', '')
+        for chunk in normalized_chunks
+        if 4 <= len(chunk.replace(' ', '')) <= 36
+    ]
+    unique_chunks = list(dict.fromkeys([chunk for chunk in [*normalized_chunks, *compound_chunks, *compact_chunks] if chunk]))
+    search_blob = f" {' '.join(unique_chunks)} "
+    token_list = list(dict.fromkeys([
+        token
+        for chunk in [*normalized_chunks, *compound_chunks, *compact_chunks]
+        for token in chunk.split()
+        if len(token) >= 2 and token not in PRODUCT_SEARCH_STOP_WORDS
+    ]))
+    search_name = normalize_product_search_text(product.get('name'))
+    search_brand = normalize_product_search_text(product.get('brand'))
+    search_model = normalize_product_search_text(product.get('model_number'))
+    search_synonyms = normalize_product_search_text(' '.join([
+        str(product.get('synonyms') or ''),
+        *derived_aliases,
+    ]))
+    typo_chunks = [search_name, search_brand, search_model]
+    typo_token_set = frozenset([
+        token
+        for chunk in [*typo_chunks, *build_compound_product_search_terms(typo_chunks)]
+        for token in normalize_product_search_text(chunk).split()
+        if 4 <= len(token) <= 18
+        and token not in PRODUCT_SEARCH_STOP_WORDS
+        and re.fullmatch(r'[a-zа-я]+', token)
+    ])
+    sort_index_raw = product.get('sort_index')
+    try:
+        sort_index = int(sort_index_raw) if sort_index_raw is not None else None
+    except (TypeError, ValueError):
+        sort_index = None
+
+    return {
+        'id': int(product.get('id') or 0),
+        'folder_id': int(product.get('folder_id') or 0) or None,
+        'sort_index': sort_index,
+        'display_name': str(product.get('name') or ''),
+        'search_name': search_name,
+        'search_brand': search_brand,
+        'search_model': search_model,
+        'search_synonyms': search_synonyms,
+        'search_blob': search_blob,
+        'search_token_list': token_list,
+        'search_token_set': frozenset(token_list),
+        'search_typo_token_set': typo_token_set,
+        'search_name_tokens': build_search_token_set(search_name),
+        'search_brand_tokens': build_search_token_set(search_brand),
+        'search_model_tokens': build_search_token_set(search_model),
+        'search_synonyms_tokens': build_search_token_set(search_synonyms),
+        'search_model_numbers': extract_product_search_numbers(' '.join([
+            str(product.get('model_number') or ''),
+        ])),
+        'search_storage_numbers': extract_storage_search_numbers(
+            product.get('storage'),
+            product.get('name'),
+            product.get('synonyms'),
+        ),
+        'search_is_ps5_console': bool(re.match(r'^(?:sony )?(?:playstation 5|ps5)\b', search_name)),
+        'search_is_accessory': any(hint in combined_search_source for hint in PRODUCT_ACCESSORY_SEARCH_HINTS),
+        'search_is_gamepad': bool(re.search(r'(геймпад|джойстик|контроллер|controller|gamepad|joystick|dualsense|joy\s*con|joycon)', combined_search_source)),
+        'search_is_game': bool(re.search(r'(^| )игра( |$)|(^| )game( |$)', combined_search_source)),
+        'search_is_phone': bool(re.search(r'(iphone|айфон|смартфон|phone|galaxy|redmi|oneplus|pixel|xiaomi|honor|huawei|realme)', combined_search_source)),
+    }
+
+
+def get_cached_product_search_entries(db, user_id):
+    cached_index = PRODUCT_SEARCH_CACHE.get(user_id)
+    if cached_index is not None:
+        return cached_index
+
+    rows = db.execute(
+        """
+        SELECT id, name, synonyms, brand, model_number, country, storage, color, folder_id, sort_index
+        FROM products
+        WHERE user_id = ?
+        ORDER BY CASE WHEN sort_index IS NULL THEN 1 ELSE 0 END, sort_index, id
+        """,
+        (user_id,),
+    ).fetchall()
+    entries = [build_server_product_search_entry(row) for row in rows]
+    entry_by_id = {int(entry['id']): entry for entry in entries}
+    token_index = {}
+    typo_index = {}
+    for entry in entries:
+        product_id = int(entry['id'])
+        for token in entry.get('search_token_set') or ():
+            token_index.setdefault(token, set()).add(product_id)
+        for token in entry.get('search_typo_token_set') or ():
+            for typo_key in build_product_search_typo_keys(token):
+                typo_index.setdefault(typo_key, set()).add(product_id)
+
+    cached_index = {
+        'entries': entries,
+        'entry_by_id': entry_by_id,
+        'token_index': token_index,
+        'typo_index': typo_index,
+    }
+    PRODUCT_SEARCH_CACHE[user_id] = cached_index
+    return cached_index
+
+
+def build_product_search_needles(query):
+    words = tokenize_product_search_query(query)
+    if not words:
+        return []
+    needles = []
+    for word in words:
+        variants = set(collect_product_search_terms(word))
+        variants.add(normalize_product_search_text(word))
+        needles.append([variant for variant in variants if variant])
+    return needles
+
+
+def token_set_matches_product_search_variant(token_set, variant):
+    normalized_variant = normalize_product_search_text(variant)
+    if not normalized_variant:
+        return False
+    tokens = token_set or ()
+    if normalized_variant in tokens:
+        return True
+
+    if normalized_variant.isdigit():
+        for token in tokens:
+            if token == normalized_variant:
+                return True
+            # A16 / i16 should match query "16", but router model WE1626 should not.
+            if token.endswith(normalized_variant) and len(token) <= len(normalized_variant) + 3:
+                prefix = token[:-len(normalized_variant)]
+                if prefix.isalpha():
+                    return True
+        return False
+
+    if len(normalized_variant) < 3:
+        return False
+
+    for token in tokens:
+        if len(token) < 2 or token in PRODUCT_SEARCH_STOP_WORDS:
+            continue
+        if token.startswith(normalized_variant):
+            return True
+        if normalized_variant in token or token in normalized_variant:
+            return True
+        if is_product_search_typo_match(token, normalized_variant):
+            return True
+    return False
+
+
+def normalized_search_field_matches(field, token_set, variant):
+    normalized_variant = normalize_product_search_text(variant)
+    if not normalized_variant:
+        return False
+    normalized_field = str(field or '')
+    if f' {normalized_variant} ' in f' {normalized_field} ':
+        return True
+    if token_set_matches_product_search_variant(token_set, normalized_variant):
+        return True
+    if normalized_variant.isdigit():
+        return False
+    return len(normalized_variant) >= 3 and normalized_variant in normalized_field
+
+
+def normalized_search_field_matches_fast(field, token_set, variant):
+    normalized_variant = normalize_product_search_text(variant)
+    if not normalized_variant:
+        return False
+    normalized_field = str(field or '')
+    tokens = token_set or set()
+    if normalized_variant in tokens:
+        return True
+    if f' {normalized_variant} ' in f' {normalized_field} ':
+        return True
+    if normalized_variant.isdigit():
+        return False
+    return len(normalized_variant) >= 3 and normalized_variant in normalized_field
+
+
+def token_matches_product_search_variant_fast(token, variant):
+    normalized_token = normalize_product_search_text(token)
+    normalized_variant = normalize_product_search_text(variant)
+    if not normalized_token or not normalized_variant:
+        return False
+    if normalized_token == normalized_variant:
+        return True
+    if normalized_variant.isdigit():
+        if normalized_token.endswith(normalized_variant) and len(normalized_token) <= len(normalized_variant) + 3:
+            prefix = normalized_token[:-len(normalized_variant)]
+            return prefix.isalpha()
+        return False
+    if len(normalized_variant) < 3 or len(normalized_token) < 2:
+        return False
+    return (
+        normalized_token.startswith(normalized_variant)
+        or normalized_variant in normalized_token
+        or normalized_token in normalized_variant
+        or is_product_search_typo_match(normalized_token, normalized_variant)
+    )
+
+
+def get_candidate_ids_from_search_index(search_index, needles):
+    if not isinstance(search_index, dict):
+        return None
+    token_index = search_index.get('token_index') or {}
+    typo_index = search_index.get('typo_index') or {}
+    if not token_index or not needles:
+        return None
+
+    candidate_sets = []
+    token_items = list(token_index.items())
+    for variants in needles:
+        ids_for_word = set()
+        normalized_variants = [
+            normalize_product_search_text(variant)
+            for variant in (variants or [])
+            if normalize_product_search_text(variant)
+        ]
+        for variant in normalized_variants:
+            direct_ids = token_index.get(variant)
+            if direct_ids:
+                ids_for_word.update(direct_ids)
+        if ids_for_word:
+            candidate_sets.append(ids_for_word)
+            continue
+
+        for variant in normalized_variants:
+            typo_ids = set()
+            for typo_key in build_product_search_typo_keys(variant):
+                found_ids = typo_index.get(typo_key)
+                if found_ids:
+                    typo_ids.update(found_ids)
+            if typo_ids:
+                ids_for_word.update(typo_ids)
+        if ids_for_word:
+            candidate_sets.append(ids_for_word)
+            continue
+
+        for variant in normalized_variants:
+            for token, product_ids in token_items:
+                if token_matches_product_search_variant_fast(token, variant):
+                    ids_for_word.update(product_ids)
+
+        if not ids_for_word:
+            return set()
+        candidate_sets.append(ids_for_word)
+
+    if not candidate_sets:
+        return None
+    candidates = candidate_sets[0]
+    for ids_for_word in candidate_sets[1:]:
+        candidates = candidates.intersection(ids_for_word)
+        if not candidates:
+            break
+    return candidates
+
+
+def product_entry_matches_search(entry, needles):
+    if not needles:
+        return True
+    haystack = str(entry.get('search_blob') or '')
+    token_set = entry.get('search_token_set') or set()
+
+    for variants in needles:
+        matched = False
+        for variant in variants:
+            normalized_variant = normalize_product_search_text(variant)
+            if not normalized_variant:
+                continue
+            if normalized_search_field_matches(haystack, token_set, normalized_variant):
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
+def get_product_entry_search_relevance(entry, needles, query_words):
+    name = str(entry.get('search_name') or '')
+    brand = str(entry.get('search_brand') or '')
+    model = str(entry.get('search_model') or '')
+    synonyms = str(entry.get('search_synonyms') or '')
+    name_tokens = entry.get('search_name_tokens') or set()
+    brand_tokens = entry.get('search_brand_tokens') or set()
+    model_tokens = entry.get('search_model_tokens') or set()
+    synonym_tokens = entry.get('search_synonyms_tokens') or set()
+    normalized_phrase = normalize_product_search_text(' '.join(query_words or []))
+    accessory_intent = is_accessory_search_intent(query_words)
+    gamepad_intent = is_gamepad_search_intent(query_words)
+    device_model_intent = looks_like_device_model_query(query_words)
+    accessory_product = bool(entry.get('search_is_accessory'))
+    gamepad_product = bool(entry.get('search_is_gamepad'))
+    game_product = bool(entry.get('search_is_game'))
+    phone_product = bool(entry.get('search_is_phone'))
+    ps5_console_product = bool(entry.get('search_is_ps5_console'))
+    ps5_intent = is_ps5_search_intent(query_words)
+    dualsense_product = 'dualsense' in name or 'dual sense' in name
+    numeric_words = [word for word in (query_words or []) if re.match(r'^\d+$', word)]
+    has_storage_intent = has_explicit_storage_query_intent(query_words)
+    model_numbers = entry.get('search_model_numbers') or []
+    storage_numbers = entry.get('search_storage_numbers') or []
+
+    score = 0
+    name_hits = 0
+    direct_hits = 0
+
+    for variants in needles:
+        has_name_hit = any(normalized_search_field_matches(name, name_tokens, variant) for variant in variants)
+        has_brand_hit = any(normalized_search_field_matches(brand, brand_tokens, variant) for variant in variants)
+        has_model_hit = any(normalized_search_field_matches(model, model_tokens, variant) for variant in variants)
+        has_synonym_hit = any(normalized_search_field_matches(synonyms, synonym_tokens, variant) for variant in variants)
+
+        if has_name_hit:
+            score += 260
+            name_hits += 1
+            direct_hits += 1
+        if has_brand_hit:
+            score += 180
+            direct_hits += 1
+        if has_model_hit:
+            score += 170
+            direct_hits += 1
+        if has_synonym_hit:
+            score += 120
+
+    if normalized_phrase:
+        if normalized_search_field_matches(name, name_tokens, normalized_phrase):
+            score += 280
+        elif normalized_search_field_matches(model, model_tokens, normalized_phrase):
+            score += 220
+        elif normalized_search_field_matches(synonyms, synonym_tokens, normalized_phrase):
+            score += 140
+
+    if (not accessory_intent) and (not has_storage_intent) and len(numeric_words) == 1 and numeric_words[0] not in PRODUCT_COMMON_STORAGE_NUMBERS:
+        query_number = numeric_words[0]
+        has_model_number_hit = query_number in model_numbers or normalized_search_field_matches(model, model_tokens, query_number)
+        has_storage_only_hit = query_number in storage_numbers and not has_model_number_hit
+
+        if has_model_number_hit:
+            score += 260
+        if has_storage_only_hit:
+            score -= 520 if accessory_product else 180
+
+    if needles and name_hits == len(needles):
+        score += 320
+    if needles and direct_hits == len(needles):
+        score += 180
+
+    if accessory_intent:
+        if accessory_product:
+            score += 140
+    else:
+        score += -360 if accessory_product else 180
+
+    if gamepad_intent:
+        if gamepad_product:
+            score += 980
+        if ps5_intent:
+            score += 3600 if dualsense_product else 200
+        if game_product:
+            score -= 1180
+    elif ps5_intent and not accessory_intent:
+        if ps5_console_product:
+            score += 5000
+        elif gamepad_product:
+            score += 1300
+        elif accessory_product or game_product:
+            score -= 1400
+        else:
+            score -= 700
+
+    if device_model_intent and not accessory_intent:
+        if accessory_product:
+            score -= 980
+        if phone_product:
+            score += 260
+
+    return score
+
+
+def get_quick_product_entry_search_relevance(entry, query_words):
+    name = str(entry.get('search_name') or '')
+    brand = str(entry.get('search_brand') or '')
+    model = str(entry.get('search_model') or '')
+    synonyms = str(entry.get('search_synonyms') or '')
+    name_tokens = entry.get('search_name_tokens') or set()
+    brand_tokens = entry.get('search_brand_tokens') or set()
+    model_tokens = entry.get('search_model_tokens') or set()
+    synonym_tokens = entry.get('search_synonyms_tokens') or set()
+    normalized_words = [normalize_product_search_text(word) for word in (query_words or []) if normalize_product_search_text(word)]
+    normalized_phrase = normalize_product_search_text(' '.join(normalized_words))
+    accessory_intent = is_accessory_search_intent(normalized_words)
+    accessory_product = bool(entry.get('search_is_accessory'))
+    gamepad_intent = is_gamepad_search_intent(normalized_words)
+    gamepad_product = bool(entry.get('search_is_gamepad'))
+    game_product = bool(entry.get('search_is_game'))
+    phone_product = bool(entry.get('search_is_phone'))
+    ps5_console_product = bool(entry.get('search_is_ps5_console'))
+    ps5_intent = is_ps5_search_intent(normalized_words)
+    dualsense_product = 'dualsense' in name or 'dual sense' in name
+    device_model_intent = looks_like_device_model_query(normalized_words)
+
+    score = 0
+    if normalized_phrase:
+        if normalized_search_field_matches_fast(name, name_tokens, normalized_phrase):
+            score += 420
+        if normalized_search_field_matches_fast(brand, brand_tokens, normalized_phrase):
+            score += 360
+        if normalized_search_field_matches_fast(model, model_tokens, normalized_phrase):
+            score += 300
+        if normalized_search_field_matches_fast(synonyms, synonym_tokens, normalized_phrase):
+            score += 160
+
+    for word in normalized_words:
+        if normalized_search_field_matches_fast(brand, brand_tokens, word):
+            score += 180
+        if normalized_search_field_matches_fast(name, name_tokens, word):
+            score += 150
+        if normalized_search_field_matches_fast(model, model_tokens, word):
+            score += 130
+        if normalized_search_field_matches_fast(synonyms, synonym_tokens, word):
+            score += 70
+
+    if accessory_intent:
+        if accessory_product:
+            score += 140
+    else:
+        score += -360 if accessory_product else 180
+
+    if gamepad_intent:
+        if gamepad_product:
+            score += 980
+        if ps5_intent:
+            score += 3600 if dualsense_product else 200
+        if game_product:
+            score -= 1180
+    elif ps5_intent and not accessory_intent:
+        if ps5_console_product:
+            score += 5000
+        elif gamepad_product:
+            score += 1300
+        elif accessory_product or game_product:
+            score -= 1400
+        else:
+            score -= 700
+
+    if device_model_intent and not accessory_intent:
+        if accessory_product:
+            score -= 980
+        if phone_product:
+            score += 260
+
+    return score
+
+
+def search_products_in_entries(entries, query, folder_ids=None, limit=200):
+    needles = build_product_search_needles(query)
+    query_words = tokenize_product_search_query(query)
+    if not needles:
+        return []
+
+    normalized_folder_ids = {int(folder_id) for folder_id in (folder_ids or set()) if folder_id}
+    indexed_candidate_mode = False
+    if isinstance(entries, dict):
+        entry_by_id = entries.get('entry_by_id') or {}
+        candidate_ids = get_candidate_ids_from_search_index(entries, needles)
+        if candidate_ids is None:
+            filtered_entries = list(entry_by_id.values())
+        else:
+            filtered_entries = [entry_by_id[product_id] for product_id in candidate_ids if product_id in entry_by_id]
+            indexed_candidate_mode = True
+    else:
+        filtered_entries = entries
+
+    if normalized_folder_ids:
+        filtered_entries = [
+            entry for entry in filtered_entries
+            if int(entry.get('folder_id') or 0) in normalized_folder_ids
+        ]
+
+    ranked_entries = []
+    use_quick_score = indexed_candidate_mode and len(filtered_entries) > 250
+    verify_candidates = (not indexed_candidate_mode) or len(filtered_entries) <= 1000
+    for entry in filtered_entries:
+        if verify_candidates and not product_entry_matches_search(entry, needles):
+            continue
+        ranked_entries.append({
+            'id': entry['id'],
+            'score': get_quick_product_entry_search_relevance(entry, query_words) if use_quick_score else get_product_entry_search_relevance(entry, needles, query_words),
+            'sort_tuple': get_product_search_sort_tuple(entry),
+        })
+
+    ranked_entries.sort(key=lambda item: (-item['score'], *item['sort_tuple']))
+    if limit is None:
+        return [item['id'] for item in ranked_entries]
+    return [item['id'] for item in ranked_entries[:limit]]
+
+
+def build_compact_product_payload(product_row):
+    product = dict(product_row)
+    photo_url = str(product.get('photo_url') or '').strip()
+    if photo_url:
+        product['photo_url'] = photo_url.split(',')[0].strip()
+    product['proposed_count'] = 1 if int(product.get('pending_count') or 0) > 0 and int(product.get('confirmed_count') or 0) == 0 else 0
+    return product
+
+
+def build_compact_product_payloads(db, user_id, product_rows):
+    products = [dict(product_row) for product_row in (product_rows or [])]
+    if not products:
+        return []
+
+    product_ids = [int(product.get('id') or 0) for product in products if product.get('id')]
+    counts_by_id = {
+        product_id: {'confirmed_count': 0, 'pending_count': 0}
+        for product_id in product_ids
+    }
+    if product_ids:
+        placeholders = ','.join('?' for _ in product_ids)
+        confirmed_rows = db.execute(f"""
+            SELECT pm.product_id, COUNT(*) AS confirmed_count
+            FROM product_messages pm
+            JOIN messages m ON pm.message_id = m.id
+            WHERE pm.status = 'confirmed'
+              AND m.user_id = ?
+              AND pm.product_id IN ({placeholders})
+            GROUP BY pm.product_id
+        """, (user_id, *product_ids)).fetchall()
+        for row in confirmed_rows:
+            counts_by_id[int(row['product_id'])]['confirmed_count'] = int(row['confirmed_count'] or 0)
+
+        pending_rows = db.execute(f"""
+            SELECT product_id, COUNT(*) AS pending_count
+            FROM product_messages
+            WHERE status = 'pending'
+              AND product_id IN ({placeholders})
+            GROUP BY product_id
+        """, tuple(product_ids)).fetchall()
+        for row in pending_rows:
+            counts_by_id[int(row['product_id'])]['pending_count'] = int(row['pending_count'] or 0)
+
+    for product in products:
+        counts = counts_by_id.get(int(product.get('id') or 0), {})
+        product['confirmed_count'] = int(counts.get('confirmed_count') or 0)
+        product['pending_count'] = int(counts.get('pending_count') or 0)
+
+    return [build_compact_product_payload(product) for product in products]
+
+
+def build_sql_search_variants_for_word(word, max_variants=14):
+    normalized_word = normalize_product_search_text(word)
+    if not normalized_word:
+        return []
+    candidates = [normalized_word, *collect_product_search_terms(normalized_word)]
+    variants = []
+    seen = set()
+    for candidate in candidates:
+        normalized = normalize_product_search_text(candidate)
+        if len(normalized) < 2 or normalized in PRODUCT_SEARCH_STOP_WORDS or normalized in seen:
+            continue
+        seen.add(normalized)
+        variants.append(normalized)
+        if len(variants) >= max_variants:
+            break
+    for literal in PRODUCT_SQL_LITERAL_SEARCH_EXPANSIONS.get(normalized_word, []):
+        if literal not in seen and len(variants) < max_variants:
+            seen.add(literal)
+            variants.append(literal)
+    return variants
+
+
+def build_sql_search_needles(query):
+    return [
+        variants
+        for variants in (build_sql_search_variants_for_word(word) for word in tokenize_product_search_query(query))
+        if variants
+    ]
+
+
+def compact_sql_search_value(value):
+    return normalize_product_search_text(value).replace(' ', '')
+
+
+def compact_sql_search_field_sql(field):
+    return (
+        "LOWER("
+        f"REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE({field}, ''), ' ', ''), '-', ''), '/', ''), '.', ''), '+', '')"
+        ")"
+    )
+
+
+def fetch_ranked_product_rows_for_ids(db, select_fields, base_from, base_params, ranked_ids):
+    page_ids = [int(product_id) for product_id in (ranked_ids or []) if product_id]
+    if not page_ids:
+        return []
+    placeholders = ','.join('?' for _ in page_ids)
+    order_case = ' '.join(f"WHEN {product_id} THEN {index}" for index, product_id in enumerate(page_ids))
+    query = f"""
+        SELECT {select_fields}
+        {base_from}
+        AND p.id IN ({placeholders})
+        ORDER BY CASE p.id {order_case} ELSE {len(page_ids)} END
+    """
+    return db.execute(query, (*base_params, *page_ids)).fetchall()
+
+
+def append_sql_search_field_match(parts, params, field, like_variant):
+    like_value = f"%{like_variant}%"
+    parts.append(f"{field} LIKE ?")
+    params.append(like_value)
+
+
+def build_fast_iphone_search_phrases(query):
+    words = tokenize_product_search_query(query)
+    if not words:
+        return []
+
+    canonical_words = []
+    has_iphone = False
+    for word in words:
+        variants = set(collect_product_search_terms(word))
+        normalized = normalize_product_search_text(word)
+        if 'iphone' in variants:
+            canonical_words.append('iphone')
+            has_iphone = True
+        elif 'pro' in variants:
+            canonical_words.append('pro')
+        elif 'max' in variants:
+            canonical_words.append('max')
+        elif 'plus' in variants:
+            canonical_words.append('plus')
+        elif 'ultra' in variants:
+            canonical_words.append('ultra')
+        elif 'mini' in variants:
+            canonical_words.append('mini')
+        elif 'air' in variants:
+            canonical_words.append('air')
+        elif normalized:
+            canonical_words.append(normalized)
+
+    if not has_iphone or len(canonical_words) < 2:
+        return []
+
+    phrases = []
+    main_phrase = ' '.join(canonical_words)
+    model_phrase = ' '.join(word for word in canonical_words if word != 'iphone')
+    candidate_phrases = [main_phrase]
+    if model_phrase and not re.fullmatch(r'\d+', model_phrase):
+        candidate_phrases.append(model_phrase)
+    for phrase in candidate_phrases:
+        phrase = normalize_product_search_text(phrase)
+        if phrase and phrase not in phrases:
+            phrases.append(phrase)
+    return phrases
+
+
+def has_search_alias(words, alias):
+    normalized_alias = normalize_product_search_text(alias)
+    return any(normalized_alias in set(collect_product_search_terms(word)) for word in (words or []))
+
+
+def is_ps5_search_intent(words, raw_query=""):
+    normalized_words = {
+        normalize_product_search_text(word)
+        for word in (words or [])
+        if normalize_product_search_text(word)
+    }
+    normalized_query = normalize_product_search_text(raw_query)
+    expanded_terms = set()
+    for word in (words or []):
+        expanded_terms.update(collect_product_search_terms(word))
+    return (
+        'ps5' in normalized_words
+        or 'пс5' in normalized_words
+        or 'ps5' in expanded_terms
+        or 'пс5' in expanded_terms
+        or re.search(r'\bps5\b', normalized_query)
+        or re.search(r'\bпс5\b', normalized_query)
+    )
+
+
+def expand_like_case_variants(variant):
+    values = [variant]
+    title_value = variant.title()
+    capitalize_value = variant.capitalize()
+    upper_value = variant.upper()
+    for value in (title_value, capitalize_value, upper_value):
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def build_ps5_extra_search_conditions(words):
+    conditions = []
+    params = []
+    searchable_fields = (
+        'p.name',
+        'p.synonyms',
+        'p.brand',
+        'p.model_number',
+        'p.color',
+        'p.storage',
+    )
+    for word in (words or []):
+        normalized_word = normalize_product_search_text(word)
+        word_terms = set(collect_product_search_terms(word))
+        if normalized_word in {'ps5', 'пс5'} or 'ps5' in word_terms or 'пс5' in word_terms:
+            continue
+        variants = build_sql_search_variants_for_word(word, max_variants=12)
+        parts = []
+        for variant in variants:
+            for like_variant in expand_like_case_variants(variant):
+                for field in searchable_fields:
+                    append_sql_search_field_match(parts, params, field, like_variant)
+        if parts:
+            conditions.append(f"({' OR '.join(parts)})")
+    return conditions, params
+
+
+def product_accessory_match_sql():
+    return """
+        (
+            p.name LIKE '%чех%' OR p.name LIKE '%Чех%' OR LOWER(p.name) LIKE '%case%' OR LOWER(p.name) LIKE '%cover%' OR LOWER(p.name) LIKE '%sleeve%'
+            OR p.name LIKE '%накладк%' OR p.name LIKE '%Накладк%' OR p.name LIKE '%стекл%' OR p.name LIKE '%Стекл%' OR LOWER(p.name) LIKE '%glass%' OR LOWER(p.name) LIKE '%film%'
+            OR p.name LIKE '%кабель%' OR p.name LIKE '%Кабель%' OR LOWER(p.name) LIKE '%cable%' OR LOWER(p.name) LIKE '%cord%'
+            OR p.name LIKE '%заряд%' OR p.name LIKE '%Заряд%' OR LOWER(p.name) LIKE '%charger%' OR LOWER(p.name) LIKE '%adapter%'
+            OR p.name LIKE '%ремеш%' OR p.name LIKE '%Ремеш%' OR p.name LIKE '%браслет%' OR p.name LIKE '%Браслет%' OR LOWER(p.name) LIKE '%strap%' OR LOWER(p.name) LIKE '% band%' OR LOWER(p.name) LIKE '% loop%' OR LOWER(p.name) LIKE '%milanese%'
+            OR LOWER(p.name) LIKE '%ssd%' OR p.name LIKE '%накопител%' OR p.name LIKE '%Накопител%' OR p.name LIKE '%дисковод%' OR p.name LIKE '%Дисковод%' OR p.name LIKE '%панел%' OR p.name LIKE '%Панел%' OR LOWER(p.name) LIKE '%panel%'
+            OR p.name LIKE '%подписк%' OR p.name LIKE '%Подписк%' OR p.name LIKE '%игра для%' OR p.name LIKE '%Игра для%' OR LOWER(p.name) LIKE '% game for%'
+            OR p.synonyms LIKE '%чех%' OR p.synonyms LIKE '%Чех%' OR LOWER(p.synonyms) LIKE '%case%' OR LOWER(p.synonyms) LIKE '%cover%' OR LOWER(p.synonyms) LIKE '%sleeve%'
+            OR p.synonyms LIKE '%накладк%' OR p.synonyms LIKE '%Накладк%' OR p.synonyms LIKE '%стекл%' OR p.synonyms LIKE '%Стекл%' OR LOWER(p.synonyms) LIKE '%glass%' OR LOWER(p.synonyms) LIKE '%film%'
+            OR p.synonyms LIKE '%кабель%' OR p.synonyms LIKE '%Кабель%' OR LOWER(p.synonyms) LIKE '%cable%' OR LOWER(p.synonyms) LIKE '%cord%'
+            OR p.synonyms LIKE '%заряд%' OR p.synonyms LIKE '%Заряд%' OR LOWER(p.synonyms) LIKE '%charger%' OR LOWER(p.synonyms) LIKE '%adapter%'
+            OR p.synonyms LIKE '%ремеш%' OR p.synonyms LIKE '%Ремеш%' OR p.synonyms LIKE '%браслет%' OR p.synonyms LIKE '%Браслет%' OR LOWER(p.synonyms) LIKE '%strap%' OR LOWER(p.synonyms) LIKE '% band%' OR LOWER(p.synonyms) LIKE '% loop%' OR LOWER(p.synonyms) LIKE '%milanese%'
+            OR LOWER(p.synonyms) LIKE '%ssd%' OR p.synonyms LIKE '%накопител%' OR p.synonyms LIKE '%Накопител%' OR p.synonyms LIKE '%дисковод%' OR p.synonyms LIKE '%Дисковод%' OR p.synonyms LIKE '%панел%' OR p.synonyms LIKE '%Панел%' OR LOWER(p.synonyms) LIKE '%panel%'
+            OR p.synonyms LIKE '%подписк%' OR p.synonyms LIKE '%Подписк%' OR p.synonyms LIKE '%игра для%' OR p.synonyms LIKE '%Игра для%' OR LOWER(p.synonyms) LIKE '% game for%'
+        )
+    """
+
+
+def product_accessory_penalty_sql(accessory_first=False):
+    accessory_rank = 0 if accessory_first else 1
+    default_rank = 1 if accessory_first else 0
+    return f"""
+        CASE
+            WHEN {product_accessory_match_sql()} THEN {accessory_rank}
+            ELSE {default_rank}
+        END
+    """
+
+
+def product_primary_device_rank_sql():
+    return f"""
+        CASE
+            WHEN p.name LIKE 'Смартфон %' OR p.name LIKE 'смартфон %' OR LOWER(p.name) LIKE 'apple iphone%' OR LOWER(p.name) LIKE '% apple iphone%' THEN 0
+            WHEN LOWER(p.name) LIKE 'apple watch%' OR LOWER(p.name) LIKE 'samsung galaxy watch%' OR LOWER(p.name) LIKE 'huawei watch%' THEN 0
+            WHEN LOWER(p.name) LIKE 'sony playstation 5%' OR LOWER(p.name) LIKE 'playstation 5%' THEN 0
+            WHEN LOWER(p.name) LIKE '%macbook%' OR LOWER(p.name) LIKE '%ipad%' OR p.name LIKE '%Планшет%' OR p.name LIKE '%планшет%' OR p.name LIKE '%Ноутбук%' OR p.name LIKE '%ноутбук%' THEN 0
+            WHEN LOWER(p.name) LIKE '%airpods%' OR p.name LIKE '%Наушники Apple%' OR p.name LIKE '%наушники Apple%' THEN 0
+            WHEN LOWER(p.name) LIKE '%dualsense%' OR LOWER(p.name) LIKE '%gamepad%' OR p.name LIKE '%Геймпад%' OR p.name LIKE '%геймпад%' THEN 1
+            WHEN {product_accessory_match_sql()} THEN 3
+            ELSE 2
+        END
+    """
+
+
+def product_variant_rank_sql():
+    return """
+        CASE
+            WHEN LOWER(p.name) LIKE '%iphone%' THEN
+                CASE
+                    WHEN LOWER(p.name) LIKE '% pro max%' THEN 4
+                    WHEN LOWER(p.name) LIKE '% ultra%' THEN 5
+                    WHEN LOWER(p.name) LIKE '% pro%' THEN 3
+                    WHEN LOWER(p.name) LIKE '% plus%' THEN 2
+                    WHEN LOWER(p.name) LIKE '% air%' THEN 1
+                    WHEN LOWER(p.name) LIKE '% mini%' THEN 6
+                    ELSE 0
+                END
+            ELSE 0
+        END
+    """
+
+
+def product_storage_rank_sql():
+    return """
+        CASE
+            WHEN p.storage LIKE '64 %' OR p.storage LIKE '64GB%' OR p.name LIKE '%64 ГБ%' OR p.name LIKE '%64 GB%' THEN 64
+            WHEN p.storage LIKE '128 %' OR p.storage LIKE '128GB%' OR p.name LIKE '%128 ГБ%' OR p.name LIKE '%128 GB%' THEN 128
+            WHEN p.storage LIKE '256 %' OR p.storage LIKE '256GB%' OR p.name LIKE '%256 ГБ%' OR p.name LIKE '%256 GB%' THEN 256
+            WHEN p.storage LIKE '512 %' OR p.storage LIKE '512GB%' OR p.name LIKE '%512 ГБ%' OR p.name LIKE '%512 GB%' THEN 512
+            WHEN p.storage LIKE '1 T%' OR p.storage LIKE '1T%' OR p.name LIKE '%1 ТБ%' OR p.name LIKE '%1 TB%' THEN 1024
+            WHEN p.storage LIKE '2 T%' OR p.storage LIKE '2T%' OR p.name LIKE '%2 ТБ%' OR p.name LIKE '%2 TB%' THEN 2048
+            ELSE 999999
+        END
+    """
+
+
 @app.route('/api/products', methods=['GET', 'POST'])
 @login_required
 def manage_products():
     user_id = session['user_id']
     db = get_db()
     if request.method == 'GET':
-        query = """
-            SELECT p.*, 
-                   (SELECT COUNT(*) FROM product_messages pm 
-                    JOIN messages m ON pm.message_id = m.id 
-                    WHERE pm.product_id = p.id AND pm.status = 'confirmed') as confirmed_count
-            FROM products p
-            WHERE p.user_id = ?
+        is_compact = str(request.args.get('compact', '')).strip().lower() in {'1', 'true', 'yes'}
+        connected_only = str(request.args.get('connected_only', '')).strip().lower() in {'1', 'true', 'yes'}
+        raw_query = str(request.args.get('q', '') or '').strip()
+        page_arg = request.args.get('page')
+        limit_arg = request.args.get('limit')
+        use_paged_compact = is_compact and (
+            bool(raw_query)
+            or page_arg is not None
+            or limit_arg is not None
+            or bool(str(request.args.get('folder_ids', '') or '').strip())
+        )
+        try:
+            page = int(page_arg or 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            limit = int(limit_arg or 20)
+        except (TypeError, ValueError):
+            limit = 20
+        page = max(1, page)
+        limit = max(1, min(limit, 100))
+
+        folder_ids = []
+        for part in str(request.args.get('folder_ids', '') or '').split(','):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                folder_ids.append(int(part))
+            except ValueError:
+                continue
+        folder_ids = list(dict.fromkeys(folder_ids))
+        if len(folder_ids) > 200:
+            folder_ids = []
+
+        select_fields = """
+            p.id,
+            p.name,
+            p.synonyms,
+            p.price,
+            p.folder_id,
+            p.photo_url,
+            p.brand,
+            p.country,
+            p.weight,
+            p.model_number,
+            p.is_on_request,
+            p.color,
+            p.storage,
+            p.ram,
+            p.warranty,
+            p.sort_index
+        """ if is_compact else "p.*"
+
+        if is_compact:
+            base_from = "FROM products p WHERE p.user_id = ?"
+            base_params = [user_id]
+        else:
+            base_from = f"""
+                FROM products p
+                LEFT JOIN (
+                    SELECT pm.product_id, COUNT(*) AS confirmed_count
+                    FROM product_messages pm
+                    JOIN messages m ON pm.message_id = m.id
+                    WHERE pm.status = 'confirmed' AND m.user_id = ?
+                    GROUP BY pm.product_id
+                ) confirmed ON confirmed.product_id = p.id
+                LEFT JOIN (
+                    SELECT product_id, COUNT(*) AS pending_count
+                    FROM product_messages
+                    WHERE status = 'pending'
+                    GROUP BY product_id
+                ) pending ON pending.product_id = p.id
+                WHERE p.user_id = ?
+            """
+            base_params = [user_id, user_id]
+
+        if folder_ids:
+            placeholders = ','.join('?' for _ in folder_ids)
+            base_from += f" AND p.folder_id IN ({placeholders})"
+            base_params.extend(folder_ids)
+        if connected_only:
+            if is_compact:
+                base_from += """
+                    AND EXISTS (
+                        SELECT 1
+                        FROM product_messages pm
+                        JOIN messages m ON pm.message_id = m.id
+                        WHERE pm.product_id = p.id
+                          AND pm.status = 'confirmed'
+                          AND m.user_id = ?
+                    )
+                """
+                base_params.append(user_id)
+            else:
+                base_from += " AND COALESCE(confirmed.confirmed_count, 0) > 0"
+
+        if use_paged_compact:
+            offset = (page - 1) * limit
+
+            if raw_query:
+                sql_needles = build_sql_search_needles(raw_query)
+                if not sql_needles:
+                    return jsonify({
+                        'items': [],
+                        'total': 0,
+                        'page': page,
+                        'limit': limit,
+                    })
+                query_words = tokenize_product_search_query(raw_query)
+                ps5_search_intent = is_ps5_search_intent(query_words, raw_query)
+                if len(query_words) == 1 and not ps5_search_intent:
+                    brand_variants = build_sql_search_variants_for_word(query_words[0], max_variants=24)
+                    if brand_variants:
+                        brand_placeholders = ','.join('?' for _ in brand_variants)
+                        brand_from = f"{base_from} AND p.brand COLLATE NOCASE IN ({brand_placeholders})"
+                        brand_params = [*base_params, *brand_variants]
+                        brand_total = int(db.execute(
+                            f"SELECT COUNT(*) AS total {brand_from}",
+                            tuple(brand_params),
+                        ).fetchone()['total'] or 0)
+                        if brand_total:
+                            brand_accessory_intent = is_accessory_search_intent(query_words)
+                            brand_query = f"""
+                                SELECT {select_fields}
+                                {brand_from}
+                                ORDER BY
+                                    {product_accessory_penalty_sql(True) if brand_accessory_intent else product_primary_device_rank_sql()},
+                                    {product_accessory_penalty_sql()} ,
+                                    {product_variant_rank_sql()},
+                                    {product_storage_rank_sql()},
+                                    CASE WHEN p.sort_index IS NULL THEN 1 ELSE 0 END,
+                                    p.sort_index,
+                                    p.id
+                                LIMIT ? OFFSET ?
+                            """
+                            rows = db.execute(brand_query, (*brand_params, limit, offset)).fetchall()
+                            return jsonify({
+                                'items': build_compact_product_payloads(db, user_id, rows),
+                                'total': brand_total,
+                                'page': page,
+                                'limit': limit,
+                            })
+
+                fast_phrase_conditions = []
+                fast_phrase_params = []
+                for phrase in build_fast_iphone_search_phrases(raw_query):
+                    like_value = f"%{phrase}%"
+                    fast_phrase_conditions.extend([
+                        "p.name LIKE ? COLLATE NOCASE",
+                        "p.synonyms LIKE ? COLLATE NOCASE",
+                    ])
+                    fast_phrase_params.extend([like_value, like_value])
+                if fast_phrase_conditions:
+                    phrase_from = f"{base_from} AND ({' OR '.join(fast_phrase_conditions)})"
+                    phrase_params = [*base_params, *fast_phrase_params]
+                    phrase_total = int(db.execute(
+                        f"SELECT COUNT(*) AS total {phrase_from}",
+                        tuple(phrase_params),
+                    ).fetchone()['total'] or 0)
+                    if phrase_total:
+                        phrase_accessory_intent = is_accessory_search_intent(query_words)
+                        phrase_query = f"""
+                            SELECT {select_fields}
+                            {phrase_from}
+                            ORDER BY
+                                {product_accessory_penalty_sql(True) if phrase_accessory_intent else product_primary_device_rank_sql()},
+                                {product_accessory_penalty_sql()} ,
+                                CASE WHEN LOWER(p.name) LIKE ? THEN 0 ELSE 1 END,
+                                {product_variant_rank_sql()},
+                                {product_storage_rank_sql()},
+                                CASE WHEN p.sort_index IS NULL THEN 1 ELSE 0 END,
+                                p.sort_index,
+                                p.id
+                            LIMIT ? OFFSET ?
+                        """
+                        phrase_rank_params = [f"%{normalize_product_search_text(raw_query)}%", limit, offset]
+                        rows = db.execute(phrase_query, (*phrase_params, *phrase_rank_params)).fetchall()
+                        return jsonify({
+                            'items': build_compact_product_payloads(db, user_id, rows),
+                            'total': phrase_total,
+                            'page': page,
+                            'limit': limit,
+                        })
+
+                if is_gamepad_search_intent(query_words) and ps5_search_intent:
+                    gamepad_from = f"""
+                        {base_from}
+                        AND (
+                            p.name LIKE ? COLLATE NOCASE
+                            OR p.synonyms LIKE ? COLLATE NOCASE
+                            OR p.name LIKE ? COLLATE NOCASE
+                            OR p.synonyms LIKE ? COLLATE NOCASE
+                            OR p.name LIKE ? COLLATE NOCASE
+                            OR p.synonyms LIKE ? COLLATE NOCASE
+                        )
+                        AND (
+                            p.name LIKE ? COLLATE NOCASE
+                            OR p.synonyms LIKE ? COLLATE NOCASE
+                        )
+                    """
+                    gamepad_params = [
+                        *base_params,
+                        '%DualSense%',
+                        '%DualSense%',
+                        '%геймпад%',
+                        '%геймпад%',
+                        '%controller%',
+                        '%controller%',
+                        '%PS5%',
+                        '%PS5%',
+                    ]
+                    gamepad_total = int(db.execute(
+                        f"SELECT COUNT(*) AS total {gamepad_from}",
+                        tuple(gamepad_params),
+                    ).fetchone()['total'] or 0)
+                    if gamepad_total:
+                        gamepad_query = f"""
+                            SELECT {select_fields}
+                            {gamepad_from}
+                            ORDER BY
+                                CASE WHEN p.name LIKE '%DualSense%' THEN 0 ELSE 1 END,
+                                CASE WHEN p.sort_index IS NULL THEN 1 ELSE 0 END,
+                                p.sort_index,
+                                p.id
+                            LIMIT ? OFFSET ?
+                        """
+                        rows = db.execute(gamepad_query, (*gamepad_params, limit, offset)).fetchall()
+                        return jsonify({
+                            'items': build_compact_product_payloads(db, user_id, rows),
+                            'total': gamepad_total,
+                            'page': page,
+                                'limit': limit,
+                            })
+
+                if ps5_search_intent and not is_accessory_search_intent(query_words):
+                    ps5_extra_conditions, ps5_extra_params = build_ps5_extra_search_conditions(query_words)
+                    ps5_extra_sql = ''.join(f" AND {condition}" for condition in ps5_extra_conditions)
+                    ps5_from = f"""
+                        {base_from}
+                        AND (
+                            LOWER(p.name) LIKE '%playstation 5%'
+                            OR LOWER(p.name) LIKE '%ps5%'
+                            OR LOWER(p.model_number) LIKE '%ps5%'
+                            OR LOWER(p.synonyms) LIKE '%playstation 5%'
+                            OR LOWER(p.synonyms) LIKE '%ps5%'
+                        )
+                        {ps5_extra_sql}
+                    """
+                    ps5_params = [*base_params, *ps5_extra_params]
+                    ps5_total = int(db.execute(
+                        f"SELECT COUNT(*) AS total {ps5_from}",
+                        tuple(ps5_params),
+                    ).fetchone()['total'] or 0)
+                    if ps5_total:
+                        ps5_query = f"""
+                            SELECT {select_fields}
+                            {ps5_from}
+                            ORDER BY
+                                CASE
+                                    WHEN LOWER(p.name) LIKE 'sony playstation 5%' OR LOWER(p.name) LIKE 'playstation 5%' THEN 0
+                                    WHEN LOWER(p.name) LIKE '%dualsense%' THEN 1
+                                    WHEN LOWER(p.name) LIKE '%gamepad%' OR p.name LIKE '%Геймпад%' OR p.name LIKE '%геймпад%' THEN 2
+                                    WHEN {product_accessory_match_sql()} THEN 4
+                                    ELSE 3
+                                END,
+                                {product_storage_rank_sql()},
+                                CASE WHEN p.sort_index IS NULL THEN 1 ELSE 0 END,
+                                p.sort_index,
+                                p.id
+                            LIMIT ? OFFSET ?
+                        """
+                        rows = db.execute(ps5_query, (*ps5_params, limit, offset)).fetchall()
+                        return jsonify({
+                            'items': build_compact_product_payloads(db, user_id, rows),
+                            'total': ps5_total,
+                            'page': page,
+                            'limit': limit,
+                        })
+
+                search_from = base_from
+                search_params = list(base_params)
+                searchable_fields = (
+                    'p.name',
+                    'p.synonyms',
+                    'p.brand',
+                    'p.model_number',
+                    'p.color',
+                    'p.storage',
+                )
+                for variants in sql_needles:
+                    parts = []
+                    for variant in variants:
+                        for like_variant in expand_like_case_variants(variant):
+                            for field in searchable_fields:
+                                append_sql_search_field_match(parts, search_params, field, like_variant)
+                    if parts:
+                        search_from += f" AND ({' OR '.join(parts)})"
+
+                total_query = f"SELECT COUNT(*) AS total {search_from}"
+                total = int(db.execute(total_query, tuple(search_params)).fetchone()['total'] or 0)
+                if total == 0:
+                    fallback_ids = search_products_in_entries(
+                        get_cached_product_search_entries(db, user_id),
+                        raw_query,
+                        folder_ids=set(folder_ids),
+                        limit=500,
+                    )
+                    if fallback_ids:
+                        fallback_page_ids = fallback_ids[offset:offset + limit]
+                        rows = fetch_ranked_product_rows_for_ids(
+                            db,
+                            select_fields,
+                            base_from,
+                            base_params,
+                            fallback_page_ids,
+                        )
+                        return jsonify({
+                            'items': build_compact_product_payloads(db, user_id, rows),
+                            'total': len(fallback_ids),
+                            'page': page,
+                            'limit': limit,
+                        })
+
+                normalized_query = normalize_product_search_text(raw_query)
+                first_word = tokenize_product_search_query(raw_query)[0] if tokenize_product_search_query(raw_query) else ''
+                first_word = normalize_product_search_text(first_word)
+                accessory_order_sql = product_accessory_penalty_sql(is_accessory_search_intent(query_words))
+                query = f"""
+                    SELECT {select_fields}
+                    {search_from}
+                    ORDER BY
+                        CASE WHEN LOWER(p.brand) = ? THEN 0 ELSE 1 END,
+                        {accessory_order_sql if is_accessory_search_intent(query_words) else product_primary_device_rank_sql()},
+                        {product_accessory_penalty_sql()} ,
+                        CASE WHEN LOWER(p.name) LIKE ? THEN 0 ELSE 1 END,
+                        {product_variant_rank_sql()},
+                        {product_storage_rank_sql()},
+                        CASE WHEN p.sort_index IS NULL THEN 1 ELSE 0 END,
+                        p.sort_index,
+                        p.id
+                    LIMIT ? OFFSET ?
+                """
+                rank_params = [
+                    first_word or normalized_query,
+                    f"%{normalized_query}%",
+                    limit,
+                    offset,
+                ]
+                rows = db.execute(query, (*search_params, *rank_params)).fetchall()
+                items = build_compact_product_payloads(db, user_id, rows)
+                return jsonify({
+                    'items': items,
+                    'total': total,
+                    'page': page,
+                    'limit': limit,
+                })
+
+            total_query = f"SELECT COUNT(*) AS total {base_from}"
+            total = int(db.execute(total_query, tuple(base_params)).fetchone()['total'] or 0)
+            query = f"""
+                SELECT {select_fields}
+                {base_from}
+                ORDER BY CASE WHEN p.sort_index IS NULL THEN 1 ELSE 0 END, p.sort_index, p.id
+                LIMIT ? OFFSET ?
+            """
+            rows = db.execute(query, (*base_params, limit, offset)).fetchall()
+            return jsonify({
+                'items': build_compact_product_payloads(db, user_id, rows),
+                'total': total,
+                'page': page,
+                'limit': limit,
+            })
+
+        count_fields = "" if is_compact else """,
+                   COALESCE(confirmed.confirmed_count, 0) AS confirmed_count,
+                   COALESCE(pending.pending_count, 0) AS pending_count
         """
-        products = db.execute(query, (user_id,)).fetchall()
-        
-        # Достаем все сообщения для поиска совпадений
+        query = f"""
+            SELECT {select_fields}{count_fields}
+            {base_from}
+            ORDER BY CASE WHEN p.sort_index IS NULL THEN 1 ELSE 0 END, p.sort_index, p.id
+        """
+        products = db.execute(query, tuple(base_params)).fetchall()
+
+        if is_compact:
+            return jsonify(build_compact_product_payloads(db, user_id, products))
+
         all_msgs = db.execute("SELECT text FROM messages WHERE user_id = ? ORDER BY date DESC LIMIT 1000", (user_id,)).fetchall()
-        
+        recent_message_lines = []
+        for row in all_msgs:
+            lines = row['text'].split('\n') if row['text'] else []
+            for line in lines:
+                if not line.strip():
+                    continue
+                line_words = clean_for_search(line)
+                if line_words:
+                    recent_message_lines.append(line_words)
+
         result = []
         for p in products:
             p_dict = dict(p)
             p_dict['proposed_count'] = 0
-            
-            # Если нет подтвержденных, ищем предложенные
+
             if p_dict['confirmed_count'] == 0 and p_dict['synonyms']:
                 synonyms_as_word_sets = []
                 for s in p_dict['synonyms'].split(','):
@@ -714,39 +4739,37 @@ def manage_products():
                         words = clean_for_search(s)
                         if words:
                             synonyms_as_word_sets.append(words)
-                
-                has_proposed = False
-                if synonyms_as_word_sets:
-                    for row in all_msgs:
-                        if has_proposed: break
-                        lines = row['text'].split('\n') if row['text'] else []
-                        for line in lines:
-                            if not line.strip(): continue
-                            line_words = clean_for_search(line)
-                            for syn_set in synonyms_as_word_sets:
-                                if syn_set.issubset(line_words):
-                                    # ЖЕСТКОЕ СРАВНЕНИЕ: Отсекаем старшие/другие модели
-                                    if "pro" not in syn_set and "pro" in line_words: continue
-                                    if "max" not in syn_set and "max" in line_words: continue
-                                    if "plus" not in syn_set and "plus" in line_words: continue
-                                    if "ultra" not in syn_set and "ultra" in line_words: continue
-                                    if "mini" not in syn_set and "mini" in line_words: continue
-                                    if "fe" not in syn_set and "fe" in line_words: continue
 
-                                    has_proposed = True
-                                    break
-                            if has_proposed: break
-                            
+                has_proposed = False
+                if synonyms_as_word_sets and recent_message_lines:
+                    for line_words in recent_message_lines:
+                        for syn_set in synonyms_as_word_sets:
+                            if syn_set.issubset(line_words):
+                                if "pro" not in syn_set and "pro" in line_words:
+                                    continue
+                                if "max" not in syn_set and "max" in line_words:
+                                    continue
+                                if "plus" not in syn_set and "plus" in line_words:
+                                    continue
+                                if "ultra" not in syn_set and "ultra" in line_words:
+                                    continue
+                                if "mini" not in syn_set and "mini" in line_words:
+                                    continue
+                                if "fe" not in syn_set and "fe" in line_words:
+                                    continue
+
+                                has_proposed = True
+                                break
+                        if has_proposed:
+                            break
+
                 p_dict['proposed_count'] = 1 if has_proposed else 0
-            
-            # Также проверяем статус 'pending' в базе (для товаров из Excel и чужих API)
-            if p_dict['proposed_count'] == 0:
-                pending_count = db.execute("SELECT COUNT(*) FROM product_messages WHERE product_id = ? AND status = 'pending'", (p_dict['id'],)).fetchone()[0]
-                if pending_count > 0:
-                    p_dict['proposed_count'] = 1
-                    
+
+            if p_dict['proposed_count'] == 0 and int(p_dict.get('pending_count') or 0) > 0:
+                p_dict['proposed_count'] = 1
+
             result.append(p_dict)
-            
+
         return jsonify(result)
         
     # POST
@@ -762,6 +4785,13 @@ def manage_products():
     except:
         syns = []
     synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
+    resolved_folder_id = resolve_product_folder_assignment(
+        db,
+        user_id,
+        request.form.get('name'),
+        folder_id,
+        request.form.get('storage'),
+    )
     
     # 2. ВСТАВЛЯЕМ ВАШ НОВЫЙ КОД ДЛЯ ФОТО ЗДЕСЬ:
     files = request.files.getlist('photos')
@@ -778,17 +4808,32 @@ def manage_products():
     photo_url_str = ",".join(saved_names) 
 
     # 3. Сохраняем все в базу данных
+    specs_payload = parse_specs_payload(
+        request.form.get('specs'),
+        {
+            'brand': request.form.get('brand'),
+            'country': request.form.get('country'),
+            'weight': request.form.get('weight'),
+            'model_number': request.form.get('model_number'),
+            'color': request.form.get('color'),
+            'storage': request.form.get('storage'),
+            'ram': request.form.get('ram'),
+            'warranty': request.form.get('warranty'),
+        },
+    )
+    specs_json = json.dumps(specs_payload, ensure_ascii=False) if specs_payload else ""
+
     # 3. Сохраняем все в базу данных
     db.execute("""
         INSERT INTO products 
-        (user_id, name, synonyms, price, folder_id, photo_url, brand, country, weight, model_number, is_on_request, color, storage, ram, warranty, description, specs) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, name, synonyms, price, folder_id, photo_url, brand, country, weight, model_number, is_on_request, color, storage, ram, warranty, description, description_html, specs, sort_index) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id, 
         request.form.get('name'), 
         synonyms_str, 
         float(request.form.get('price', 0.0)), 
-        folder_id,
+        resolved_folder_id,
         
         photo_url_str,
         
@@ -804,15 +4849,83 @@ def manage_products():
         request.form.get('ram'),
         request.form.get('warranty'),
         request.form.get('description'),
-        request.form.get('specs')
+        request.form.get('description_html'),
+        specs_json,
+        get_next_product_sort_index(db, user_id)
     ))
     db.commit()
     notify_clients()
     return jsonify({'success': True})
 
-@app.route('/api/products/<int:prod_id>', methods=['DELETE'])
+
+@app.route('/api/products/search')
+@login_required
+def search_products_route():
+    user_id = session['user_id']
+    raw_query = str(request.args.get('q', '') or '').strip()
+    if not raw_query:
+        return jsonify({'ids': [], 'count': 0})
+
+    try:
+        limit = int(request.args.get('limit', 200))
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(10, min(limit, 500))
+
+    folder_ids = set()
+    for part in str(request.args.get('folder_ids', '') or '').split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            folder_ids.add(int(part))
+        except ValueError:
+            continue
+
+    db = get_db()
+    entries = get_cached_product_search_entries(db, user_id)
+    result_ids = search_products_in_entries(entries, raw_query, folder_ids=folder_ids, limit=limit)
+    return jsonify({
+        'ids': result_ids,
+        'count': len(result_ids),
+    })
+
+@app.route('/api/products/<int:prod_id>', methods=['GET', 'DELETE'])
 @login_required
 def delete_product(prod_id):
+    if request.method == 'GET':
+        db = get_db()
+        user_id = session['user_id']
+        product = db.execute(
+            """
+            SELECT p.*,
+                   COALESCE(confirmed.confirmed_count, 0) AS confirmed_count,
+                   COALESCE(pending.pending_count, 0) AS pending_count
+            FROM products p
+            LEFT JOIN (
+                SELECT pm.product_id, COUNT(*) AS confirmed_count
+                FROM product_messages pm
+                JOIN messages m ON pm.message_id = m.id
+                WHERE pm.status = 'confirmed' AND m.user_id = ?
+                GROUP BY pm.product_id
+            ) confirmed ON confirmed.product_id = p.id
+            LEFT JOIN (
+                SELECT product_id, COUNT(*) AS pending_count
+                FROM product_messages
+                WHERE status = 'pending'
+                GROUP BY product_id
+            ) pending ON pending.product_id = p.id
+            WHERE p.id = ? AND p.user_id = ?
+            """,
+            (user_id, prod_id, user_id),
+        ).fetchone()
+        if not product:
+            return jsonify({'error': 'Товар не найден'}), 404
+
+        product_dict = dict(product)
+        product_dict['proposed_count'] = 1 if int(product_dict.get('pending_count') or 0) > 0 and int(product_dict.get('confirmed_count') or 0) == 0 else 0
+        return jsonify(product_dict)
+
     db = get_db()
     db.execute("DELETE FROM products WHERE id=? AND user_id=?", (prod_id, session['user_id']))
     db.commit()
@@ -827,7 +4940,7 @@ def get_all_confirmed():
     db = get_db()
     
     query = """
-        SELECT pm.id as binding_id, pm.group_id, p.id as product_id, p.name as product_name, pm.extracted_price, m.text, 
+        SELECT pm.id as binding_id, pm.group_id, p.id as product_id, p.name as product_name, p.sort_index as product_sort_index, pm.extracted_price, m.text, 
                m.chat_id, m.chat_title, m.sender_name, m.date, pm.line_index, pm.message_id, pm.is_actual,
                m.telegram_message_id, m.type, ec.sheet_url, tc.chat_title as tc_chat_title, tc.custom_name
         FROM product_messages pm
@@ -1061,6 +5174,34 @@ def init_db():
             is_active INTEGER DEFAULT 1
         )
     ''')
+        db.execute('''
+        CREATE TABLE IF NOT EXISTS ai_autofill_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cache_key TEXT UNIQUE NOT NULL,
+            user_id INTEGER DEFAULT 0,
+            product_name TEXT NOT NULL,
+            article TEXT DEFAULT '',
+            payload TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+        db.execute('''
+        CREATE TABLE IF NOT EXISTS ai_repair_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            product_name TEXT NOT NULL,
+            article TEXT DEFAULT '',
+            preferred_folder_id INTEGER,
+            status TEXT DEFAULT 'pending',
+            attempts INTEGER DEFAULT 0,
+            next_retry_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+        )
+    ''')
         db.executescript('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1080,13 +5221,17 @@ def init_db():
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
-                telegram_message_id INTEGER UNIQUE,
+                telegram_message_id INTEGER,
                 type TEXT,
                 text TEXT,
                 date TIMESTAMP,
                 chat_id INTEGER,
                 chat_title TEXT,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                is_blocked INTEGER DEFAULT 0,
+                sender_name TEXT,
+                is_delayed INTEGER DEFAULT 0,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE(chat_id, telegram_message_id)
             );
             CREATE TABLE IF NOT EXISTS folders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1120,7 +5265,21 @@ def init_db():
                 name TEXT NOT NULL,
                 synonyms TEXT,
                 price REAL,
+                sort_index INTEGER,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS product_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                line_index INTEGER DEFAULT -1,
+                group_id INTEGER,
+                status TEXT DEFAULT 'proposed',
+                extracted_price REAL,
+                is_actual INTEGER DEFAULT 1,
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
+                FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                UNIQUE(product_id, message_id, line_index)
             );
             
             CREATE TABLE IF NOT EXISTS interaction_bots (
@@ -1140,6 +5299,7 @@ def init_db():
         # 1. Безопасное добавление колонок
         columns_to_add = [
             ("products", "photo_url TEXT DEFAULT NULL"),
+            ("products", "source_url TEXT DEFAULT NULL"),
             ("products", "brand TEXT DEFAULT NULL"),
             ("products", "country TEXT DEFAULT NULL"),
             ("products", "weight TEXT DEFAULT NULL"),
@@ -1154,13 +5314,16 @@ def init_db():
             ("products", "ram TEXT DEFAULT NULL"),
             ("products", "warranty TEXT DEFAULT NULL"),
             ("products", "description TEXT DEFAULT NULL"),
+            ("products", "description_html TEXT DEFAULT NULL"),
             ("products", "specs TEXT DEFAULT NULL"),
+            ("products", "sort_index INTEGER"),
             ("products", "specs TEXT DEFAULT NULL"),
             ("products", "color TEXT DEFAULT NULL"),
             ("products", "storage TEXT DEFAULT NULL"),
             ("products", "ram TEXT DEFAULT NULL"),
             ("products", "warranty TEXT DEFAULT NULL"),
             ("products", "description TEXT DEFAULT NULL"),
+            ("products", "description_html TEXT DEFAULT NULL"),
             ("products", "specs TEXT DEFAULT NULL"),
             ("product_messages", "line_index INTEGER DEFAULT -1"),
             ("product_messages", "group_id INTEGER"),
@@ -1168,6 +5331,7 @@ def init_db():
             ("product_messages", "group_id INTEGER"),
             ("product_messages", "is_actual INTEGER DEFAULT 1"), 
             ("messages", "is_blocked INTEGER DEFAULT 0"),
+            ("messages", "is_delayed INTEGER DEFAULT 0"),
             ("tracked_chats", "custom_name TEXT"),
             ("interaction_bots", "custom_name TEXT"),
             ("messages", "sender_name TEXT"),
@@ -1207,41 +5371,52 @@ def init_db():
             except sqlite3.OperationalError:
                 pass # Если колонка уже есть, просто идем к следующей
 
+        try:
+            db.execute("UPDATE products SET sort_index = id WHERE sort_index IS NULL")
+        except sqlite3.OperationalError:
+            pass
+
         # 2. Обновление таблицы привязок (чтобы разные строки одного сообщения не затирали друг друга)
         # 2. Обновление таблицы привязок
 
-        # --- ТАБЛИЦА ДЛЯ НАСТРОЕК EXCEL (С ПОДДЕРЖКОЙ ЛИСТОВ) ---
-        db.executescript('''
-            CREATE TABLE IF NOT EXISTS excel_configs_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                sheet_name TEXT NOT NULL,
-                name_col INTEGER NOT NULL,
-                name_row_offset INTEGER NOT NULL,
-                price_col INTEGER NOT NULL,
-                price_row_offset INTEGER NOT NULL,
-                block_step INTEGER NOT NULL,
-                start_row INTEGER NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-                UNIQUE(chat_id, sheet_name)
-            );
-        ''')
-
-
-        # Безопасный перенос старых данных (если они были) и переименование
-        try:
+        excel_configs_sql = get_table_sql(db, 'excel_configs')
+        if excel_configs_sql and 'sheet_name TEXT NOT NULL' not in excel_configs_sql:
+            db.execute("PRAGMA foreign_keys = OFF")
             db.executescript('''
-                INSERT OR IGNORE INTO excel_configs_new (id, user_id, chat_id, sheet_name, name_col, name_row_offset, price_col, price_row_offset, block_step, start_row)
-                SELECT id, user_id, chat_id, 'Лист1', name_col, name_row_offset, price_col, price_row_offset, block_step, start_row FROM excel_configs;
+                CREATE TABLE IF NOT EXISTS excel_configs_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    sheet_name TEXT NOT NULL,
+                    name_col INTEGER NOT NULL,
+                    name_row_offset INTEGER NOT NULL,
+                    price_col INTEGER NOT NULL,
+                    price_row_offset INTEGER NOT NULL,
+                    block_step INTEGER NOT NULL,
+                    start_row INTEGER NOT NULL,
+                    is_grouped INTEGER DEFAULT 0,
+                    sku_col INTEGER DEFAULT -1,
+                    source_type TEXT DEFAULT 'excel',
+                    sheet_url TEXT,
+                    parse_interval INTEGER DEFAULT 60,
+                    folder_id INTEGER,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    UNIQUE(chat_id, sheet_name)
+                );
+                INSERT OR IGNORE INTO excel_configs_new (
+                    id, user_id, chat_id, sheet_name, name_col, name_row_offset,
+                    price_col, price_row_offset, block_step, start_row,
+                    is_grouped, sku_col, source_type, sheet_url, parse_interval, folder_id
+                )
+                SELECT
+                    id, user_id, chat_id, 'Лист1', name_col, name_row_offset,
+                    price_col, price_row_offset, block_step, start_row,
+                    0, -1, 'excel', NULL, 60, NULL
+                FROM excel_configs;
                 DROP TABLE excel_configs;
+                ALTER TABLE excel_configs_new RENAME TO excel_configs;
             ''')
-        except Exception:
-            pass
-        try:
-            db.executescript('ALTER TABLE excel_configs_new RENAME TO excel_configs;')
-        except Exception:
-            pass
+            db.execute("PRAGMA foreign_keys = ON")
 
 
 
@@ -1263,14 +5438,21 @@ def init_db():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
                     chat_id INTEGER NOT NULL,
+                    sheet_name TEXT NOT NULL DEFAULT '*',
                     name_col INTEGER NOT NULL,
                     name_row_offset INTEGER NOT NULL,
                     price_col INTEGER NOT NULL,
                     price_row_offset INTEGER NOT NULL,
                     block_step INTEGER NOT NULL,
                     start_row INTEGER NOT NULL,
+                    is_grouped INTEGER DEFAULT 0,
+                    sku_col INTEGER DEFAULT -1,
+                    source_type TEXT DEFAULT 'excel',
+                    sheet_url TEXT,
+                    parse_interval INTEGER DEFAULT 60,
+                    folder_id INTEGER,
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-                    UNIQUE(chat_id)
+                    UNIQUE(chat_id, sheet_name)
                 );
             ''')
             # --- ТАБЛИЦЫ ДЛЯ API И НАЦЕНОК ---
@@ -1319,34 +5501,58 @@ def init_db():
             pass
 
 
-        # --- ИСПРАВЛЕНИЕ БАГА "5 СООБЩЕНИЙ" (Снятие глобального UNIQUE) ---
-        try:
-            db.executescript('''
-                CREATE TABLE IF NOT EXISTS messages_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    telegram_message_id INTEGER,
-                    type TEXT,
-                    text TEXT,
-                    date TIMESTAMP,
-                    chat_id INTEGER,
-                    chat_title TEXT,
-                    is_blocked INTEGER DEFAULT 0,
-                    sender_name TEXT,
-                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-                    UNIQUE(chat_id, telegram_message_id) -- Теперь уникальность только внутри одного чата!
-                );
-                
-                -- Переносим все старые сообщения в новую правильную таблицу
-                INSERT OR IGNORE INTO messages_new (id, user_id, telegram_message_id, type, text, date, chat_id, chat_title, is_blocked, sender_name)
-                SELECT id, user_id, telegram_message_id, type, text, date, chat_id, chat_title, is_blocked, sender_name FROM messages;
-                
-                -- Удаляем сломанную таблицу и ставим на её место новую
-                DROP TABLE messages;
-                ALTER TABLE messages_new RENAME TO messages;
-            ''')
-        except Exception as e:
-            logger.error(f"Ошибка миграции сообщений: {e}")
+        messages_sql = get_table_sql(db, 'messages')
+        if messages_sql and 'UNIQUE(chat_id, telegram_message_id)' not in messages_sql:
+            try:
+                db.execute("PRAGMA foreign_keys = OFF")
+                db.executescript('''
+                    CREATE TABLE IF NOT EXISTS messages_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        telegram_message_id INTEGER,
+                        type TEXT,
+                        text TEXT,
+                        date TIMESTAMP,
+                        chat_id INTEGER,
+                        chat_title TEXT,
+                        is_blocked INTEGER DEFAULT 0,
+                        sender_name TEXT,
+                        is_delayed INTEGER DEFAULT 0,
+                        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                        UNIQUE(chat_id, telegram_message_id)
+                    );
+                    INSERT OR IGNORE INTO messages_new (
+                        id, user_id, telegram_message_id, type, text, date,
+                        chat_id, chat_title, is_blocked, sender_name, is_delayed
+                    )
+                    SELECT
+                        id, user_id, telegram_message_id, type, text, date,
+                        chat_id, chat_title, is_blocked, sender_name,
+                        0
+                    FROM messages;
+                    DROP TABLE messages;
+                    ALTER TABLE messages_new RENAME TO messages;
+                ''')
+                db.execute("PRAGMA foreign_keys = ON")
+            except Exception as e:
+                logger.error(f"Ошибка миграции сообщений: {e}")
+
+        performance_indexes = (
+            "CREATE INDEX IF NOT EXISTS idx_products_user_sort ON products(user_id, sort_index, id)",
+            "CREATE INDEX IF NOT EXISTS idx_products_user_folder_sort ON products(user_id, folder_id, sort_index, id)",
+            "CREATE INDEX IF NOT EXISTS idx_products_user_brand ON products(user_id, brand)",
+            "CREATE INDEX IF NOT EXISTS idx_products_user_brand_nocase ON products(user_id, brand COLLATE NOCASE, sort_index, id)",
+            "CREATE INDEX IF NOT EXISTS idx_product_messages_product_status ON product_messages(product_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_product_messages_status_product ON product_messages(status, product_id)",
+            "CREATE INDEX IF NOT EXISTS idx_product_messages_message ON product_messages(message_id)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_folders_user_parent ON folders(user_id, parent_id, id)",
+        )
+        for index_sql in performance_indexes:
+            try:
+                db.execute(index_sql)
+            except sqlite3.OperationalError as e:
+                logger.warning(f"Не удалось создать индекс производительности: {e}")
 
         # 3. Создание учетки администратора по умолчанию
         cursor = db.execute("SELECT COUNT(*) FROM users")
@@ -1385,32 +5591,86 @@ def edit_product(prod_id):
     except:
         syns = []
     synonyms_str = ", ".join([s.strip() for s in syns if s.strip()])
+    resolved_folder_id = resolve_product_folder_assignment(
+        db,
+        session['user_id'],
+        request.form.get('name'),
+        request.form.get('folder_id'),
+        request.form.get('storage'),
+    )
 
     # 2. Существующие фото, которые не были удалены
     try:
         existing_photos = json.loads(request.form.get('existing_photos', '[]'))
     except:
         existing_photos = []
+    try:
+        photo_order = json.loads(request.form.get('photo_order', '[]'))
+    except:
+        photo_order = []
 
     # 3. Сохраняем новые фото, если они были добавлены
     files = request.files.getlist('photos')
+    new_photo_tokens = request.form.getlist('new_photo_tokens')
     saved_names = []
-    for file in files:
+    saved_by_token = {}
+    for index, file in enumerate(files):
         if file and file.filename:
             ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else 'jpg'
             filename = f"{uuid.uuid4().hex}.{ext}"
             file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
             saved_names.append(filename)
+            if index < len(new_photo_tokens):
+                saved_by_token[new_photo_tokens[index]] = filename
 
-    # 4. Склеиваем старые фото и новые загруженные
-    all_photos = existing_photos + saved_names
+    # 4. Собираем финальный порядок фото
+    all_photos = []
+    used_existing = set()
+    used_new = set()
+    if isinstance(photo_order, list) and photo_order:
+        for item in photo_order:
+            if not isinstance(item, dict):
+                continue
+            item_kind = item.get('kind')
+            item_value = item.get('value')
+            if item_kind == 'existing' and item_value in existing_photos and item_value not in used_existing:
+                all_photos.append(item_value)
+                used_existing.add(item_value)
+            elif item_kind == 'new' and item_value in saved_by_token and item_value not in used_new:
+                all_photos.append(saved_by_token[item_value])
+                used_new.add(item_value)
+
+    for photo_name in existing_photos:
+        if photo_name not in used_existing:
+            all_photos.append(photo_name)
+    for token, photo_name in saved_by_token.items():
+        if token not in used_new:
+            all_photos.append(photo_name)
+    if not all_photos:
+        all_photos = existing_photos + saved_names
+
     photo_url_str = ",".join(all_photos)
+
+    specs_payload = parse_specs_payload(
+        request.form.get('specs'),
+        {
+            'brand': request.form.get('brand'),
+            'country': request.form.get('country'),
+            'weight': request.form.get('weight'),
+            'model_number': request.form.get('model_number'),
+            'color': request.form.get('color'),
+            'storage': request.form.get('storage'),
+            'ram': request.form.get('ram'),
+            'warranty': request.form.get('warranty'),
+        },
+    )
+    specs_json = json.dumps(specs_payload, ensure_ascii=False) if specs_payload else ""
 
     # 5. Обновляем товар в базе
     db.execute("""
         UPDATE products 
         SET name=?, synonyms=?, photo_url=?, brand=?, country=?, weight=?, model_number=?, is_on_request=?, folder_id=?,
-            color=?, storage=?, ram=?, warranty=?, description=?, specs=?
+            color=?, storage=?, ram=?, warranty=?, description=?, description_html=?, specs=?
         WHERE id=? AND user_id=?
     """, (
         request.form.get('name'), 
@@ -1421,7 +5681,7 @@ def edit_product(prod_id):
         request.form.get('weight'),
         request.form.get('model_number'),
         1 if request.form.get('is_on_request') == '1' else 0,
-        request.form.get('folder_id'), 
+        resolved_folder_id, 
         
         # 🔽 ДОБАВЛЯЕМ ПРИЕМ ПОЛЕЙ
         request.form.get('color'),
@@ -1429,7 +5689,8 @@ def edit_product(prod_id):
         request.form.get('ram'),
         request.form.get('warranty'),
         request.form.get('description'),
-        request.form.get('specs'), # Предполагается, что с фронта specs придет как JSON-строка
+        request.form.get('description_html'),
+        specs_json,
 
         prod_id, 
         session['user_id']
@@ -1446,6 +5707,10 @@ def edit_product(prod_id):
 @login_required
 def get_access_tree():
     user_id = session['user_id']
+    cached_tree = ACCESS_TREE_CACHE.get(int(user_id))
+    if cached_tree is not None:
+        return jsonify(cached_tree)
+
     db = get_db()
     folders = [dict(f) for f in db.execute("SELECT id, name, parent_id FROM folders WHERE user_id=?", (user_id,)).fetchall()]
     
@@ -1459,7 +5724,7 @@ def get_access_tree():
         LEFT JOIN tracked_chats tc ON m.chat_id = tc.chat_id AND m.user_id = tc.user_id
         WHERE p.user_id = ?
         GROUP BY p.id, m.chat_id
-        ORDER BY p.name
+        ORDER BY CASE WHEN p.sort_index IS NULL THEN 1 ELSE 0 END, p.sort_index, p.id
     """, (user_id,)).fetchall()
     
     products = {}
@@ -1471,8 +5736,10 @@ def get_access_tree():
             c_name = row['custom_name'] if row['custom_name'] else (row['chat_title'] or 'Неизвестный поставщик')
             if not any(c['chat_id'] == row['chat_id'] for c in products[pid]['chats']):
                 products[pid]['chats'].append({'chat_id': row['chat_id'], 'name': c_name})
-            
-    return jsonify({'folders': folders, 'products': list(products.values())})
+
+    payload = {'folders': folders, 'products': list(products.values())}
+    ACCESS_TREE_CACHE[int(user_id)] = payload
+    return jsonify(payload)
 
 
 
@@ -1904,7 +6171,7 @@ def get_catalog_for_client(client_id):
             
     products_raw = db.execute("""
         SELECT p.id, p.name, p.folder_id, p.price as manual_price, p.photo_url, p.brand, p.country, p.weight, p.model_number, p.is_on_request,
-               p.color, p.storage, p.ram, p.warranty, p.description, p.specs,
+               p.color, p.storage, p.ram, p.warranty, p.description, p.description_html, p.specs,
                (SELECT pm.extracted_price FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as parsed_price,
                (SELECT pm.is_actual FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as is_actual,
                (SELECT m.chat_id FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as latest_chat_id
@@ -1960,12 +6227,7 @@ def get_catalog_for_client(client_id):
                         photo_list.append(f"https://engine.astoredirect.ru/uploads/{url}")
 
         # Единый, правильный парсинг specs
-        specs_data = {}
-        if p['specs']:
-            try:
-                specs_data = json.loads(p['specs'])
-            except Exception:
-                pass
+        specs_data = parse_specs_payload(p['specs'], p)
 
         products.append({
             'id': p['id'],
@@ -1986,6 +6248,7 @@ def get_catalog_for_client(client_id):
             'ram': p['ram'],
             'warranty': p['warranty'],
             'description': p['description'],
+            'description_html': p['description_html'],
             'specs': specs_data
         })
         
@@ -2211,7 +6474,13 @@ def google_sheets_scheduler():
                                             exists = db.execute("SELECT id FROM product_messages WHERE product_id=? AND message_id=?", (prod['id'], new_msg_id)).fetchone()
                                             if not exists:
                                                 db.execute("INSERT INTO product_messages (product_id, message_id, extracted_price, status, is_actual, line_index) VALUES (?, ?, ?, 'pending', 1, ?)", (prod['id'], new_msg_id, ext_p, idx + 1))
-                                            break
+                                                update_product_sort_index(
+                                                    db,
+                                                    user_id,
+                                                    prod['id'],
+                                                    build_product_sort_index(idx + 1, prod.get('name')),
+                                                )
+                                                break
                                             
                                 db.commit()
                                 notify_clients()
@@ -2407,6 +6676,9 @@ def login_required(f):
     def wrapped(*args, **kwargs):
         if 'user_id' not in session:
             return redirect(url_for('login_page'))
+        user = get_session_user_record()
+        if has_invalid_session_token(user):
+            return build_expired_session_response()
         return f(*args, **kwargs)
     return wrapped
 
@@ -2415,10 +6687,9 @@ def admin_required(f):
     def wrapped(*args, **kwargs):
         if 'user_id' not in session:
             return redirect(url_for('login_page'))
-        user_id = session['user_id']
-        db = get_db()
-        cursor = db.execute("SELECT role FROM users WHERE id = ?", (user_id,))
-        row = cursor.fetchone()
+        row = get_session_user_record()
+        if has_invalid_session_token(row):
+            return build_expired_session_response()
         if not row or row['role'] != 'admin':
             return "Access denied", 403
         return f(*args, **kwargs)
@@ -2455,13 +6726,11 @@ def stop_message_listener(session_id):
 
 @app.route('/logo.svg')
 def serve_logo():
-    # Отдаем файл logo.svg прямо из корня проекта
-    return send_from_directory(os.getcwd(), 'logo.svg')
-
-
-@app.route('/logo-transparent.png')
-def serve_logo_transparent():
-    return send_from_directory(os.getcwd(), 'logo-transparent.png')
+    # Отдаем логотип из директории приложения, а не из текущего cwd процесса
+    response = send_from_directory(BASE_DIR, 'logo.svg', max_age=31536000)
+    response.cache_control.public = True
+    response.cache_control.max_age = 31536000
+    return response
 
 # Было: @app.route('/api/excel/configs/chat/<int:chat_id>', methods=['DELETE'])
 @app.route('/api/excel/configs/chat/<chat_id>', methods=['DELETE'])
@@ -2995,6 +7264,7 @@ def login_page():
         return render_template_string(LOGIN_TEMPLATE, error="Неверный логин или пароль")
     return render_template_string(LOGIN_TEMPLATE)
 
+
 @app.route('/logout')
 def logout():
     session.clear()
@@ -3007,7 +7277,12 @@ def get_publish_tree_data():
     user_id = session.get('user_id')
     
     folders = db.execute("SELECT id, name, parent_id FROM folders WHERE user_id=?", (user_id,)).fetchall()
-    products = db.execute("SELECT id, name, folder_id FROM products WHERE user_id=?", (user_id,)).fetchall()
+    products = db.execute("""
+        SELECT id, name, folder_id, sort_index
+        FROM products
+        WHERE user_id=?
+        ORDER BY CASE WHEN sort_index IS NULL THEN 1 ELSE 0 END, sort_index, id
+    """, (user_id,)).fetchall()
     
     # Получаем поставщиков, у которых есть актуальные цены на товары
     # ВАЖНО: Я использую m.chat_id и m.chat_title. Если в вашей базе таблица messages 
@@ -3294,8 +7569,17 @@ def api_parser_scheduler():
                                 if prod_row:
                                     prod_id = prod_row['id']
                                 else:
-                                    cur = db.execute("INSERT INTO products (user_id, name) VALUES (?, ?) RETURNING id", (user_id, name))
+                                    cur = db.execute(
+                                        "INSERT INTO products (user_id, name, sort_index) VALUES (?, ?, ?) RETURNING id",
+                                        (user_id, name, build_product_sort_index(i + 1, name)),
+                                    )
                                     prod_id = cur.fetchone()['id']
+                                update_product_sort_index(
+                                    db,
+                                    user_id,
+                                    prod_id,
+                                    build_product_sort_index(i + 1, name),
+                                )
                                     
                                 # line_index = i + 1, так как 0-я строка - это заголовок "Авто-обновление..."
                                 db.execute("""
@@ -3603,6 +7887,42 @@ def get_folder_tree():
     # Извлекаем все папки из БД
     cursor = db.execute("SELECT id, name, parent_id FROM folders WHERE user_id = ?", (user_id,))
     rows = cursor.fetchall()
+
+    direct_product_counts = {
+        int(row['folder_id']): int(row['count'] or 0)
+        for row in db.execute(
+            """
+            SELECT folder_id, COUNT(*) AS count
+            FROM products
+            WHERE user_id = ? AND folder_id IS NOT NULL
+            GROUP BY folder_id
+            """,
+            (user_id,),
+        ).fetchall()
+        if row['folder_id'] is not None
+    }
+    direct_connected_counts = {
+        int(row['folder_id']): int(row['count'] or 0)
+        for row in db.execute(
+            """
+            SELECT p.folder_id, COUNT(*) AS count
+            FROM products p
+            WHERE p.user_id = ?
+              AND p.folder_id IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM product_messages pm
+                  JOIN messages m ON pm.message_id = m.id
+                  WHERE pm.product_id = p.id
+                    AND pm.status = 'confirmed'
+                    AND m.user_id = ?
+              )
+            GROUP BY p.folder_id
+            """,
+            (user_id, user_id),
+        ).fetchall()
+        if row['folder_id'] is not None
+    }
     
     folders = {}
     roots = []
@@ -3613,6 +7933,10 @@ def get_folder_tree():
             'id': row['id'],
             'name': row['name'],
             'parent_id': row['parent_id'],
+            'direct_product_count': direct_product_counts.get(int(row['id']), 0),
+            'direct_connected_product_count': direct_connected_counts.get(int(row['id']), 0),
+            'product_count': 0,
+            'connected_product_count': 0,
             'children': []
         }
         
@@ -3626,6 +7950,19 @@ def get_folder_tree():
                 
     # 3. Применяем умную сортировку ко всему дереву перед отправкой на фронтенд
     sort_folders_recursive(roots)
+
+    def populate_counts(items):
+        total_products = 0
+        total_connected = 0
+        for item in items:
+            child_products, child_connected = populate_counts(item.get('children') or [])
+            item['product_count'] = int(item.get('direct_product_count') or 0) + child_products
+            item['connected_product_count'] = int(item.get('direct_connected_product_count') or 0) + child_connected
+            total_products += item['product_count']
+            total_connected += item['connected_product_count']
+        return total_products, total_connected
+
+    populate_counts(roots)
                 
     return jsonify(roots)
 
@@ -3674,6 +8011,61 @@ def rename_folder_route(folder_id):
     except Exception as e:
         logger.error(f"Ошибка переименования: {e}")
         return jsonify({'error': 'Системная ошибка при переименовании'}), 500
+
+@app.route('/api/folders/<int:folder_id>/move', methods=['POST'])
+@login_required
+def move_folder_route(folder_id):
+    user_id = session['user_id']
+    data = request.get_json() or {}
+    parent_id = data.get('parent_id')
+
+    db = get_db()
+    folder = db.execute(
+        "SELECT id, name, parent_id FROM folders WHERE id = ? AND user_id = ?",
+        (folder_id, user_id)
+    ).fetchone()
+    if not folder:
+        return jsonify({'error': 'Папка не найдена'}), 404
+    if folder['name'] == 'По умолчанию':
+        return jsonify({'error': 'Нельзя перемещать папку по умолчанию'}), 400
+
+    if parent_id in ('', None):
+        parent_id = None
+    else:
+        try:
+            parent_id = int(parent_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Некорректная целевая папка'}), 400
+
+    if parent_id == folder_id:
+        return jsonify({'error': 'Нельзя переместить папку в саму себя'}), 400
+
+    if parent_id is not None:
+        target = db.execute(
+            "SELECT id FROM folders WHERE id = ? AND user_id = ?",
+            (parent_id, user_id)
+        ).fetchone()
+        if not target:
+            return jsonify({'error': 'Целевая папка не найдена'}), 404
+
+        folders_raw = db.execute(
+            "SELECT id, parent_id FROM folders WHERE user_id = ?",
+            (user_id,)
+        ).fetchall()
+        parent_map = {row['id']: row['parent_id'] for row in folders_raw}
+        cursor = parent_id
+        while cursor is not None:
+            if cursor == folder_id:
+                return jsonify({'error': 'Нельзя переместить папку внутрь самой себя или своей подпапки'}), 400
+            cursor = parent_map.get(cursor)
+
+    db.execute(
+        "UPDATE folders SET parent_id = ? WHERE id = ? AND user_id = ?",
+        (parent_id, folder_id, user_id)
+    )
+    db.commit()
+    notify_clients()
+    return jsonify({'success': True})
 
 @app.route('/api/folders/<int:folder_id>', methods=['DELETE'])
 @login_required
@@ -4096,6 +8488,78 @@ def admin_add_user():
         return jsonify({'error': 'Login already exists'}), 400
 
 
+@app.route('/api/admin/users/<int:user_id>/password', methods=['POST'])
+@admin_required
+def admin_reset_user_password(user_id):
+    data = request.get_json() or {}
+    password = (data.get('password') or '').strip()
+    if not password:
+        return jsonify({'error': 'Password required'}), 400
+
+    db = get_db()
+    user = db.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    pwd_hash = hashlib.sha256(password.encode()).hexdigest()
+    db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (pwd_hash, user_id))
+    db.commit()
+    return jsonify({'success': True})
+
+
+@app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
+@admin_required
+def admin_delete_user(user_id):
+    current_user_id = session.get('user_id')
+    if current_user_id == user_id:
+        return jsonify({'error': 'Нельзя удалить текущего администратора'}), 400
+
+    db = get_db()
+    user = db.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    try:
+        db.execute("DELETE FROM saved_messages WHERE message_id IN (SELECT id FROM messages WHERE user_id = ?)", (user_id,))
+        db.execute("DELETE FROM saved_messages WHERE folder_id IN (SELECT id FROM folders WHERE user_id = ?)", (user_id,))
+        db.execute("DELETE FROM product_messages WHERE message_id IN (SELECT id FROM messages WHERE user_id = ?)", (user_id,))
+        db.execute("DELETE FROM product_messages WHERE product_id IN (SELECT id FROM products WHERE user_id = ?)", (user_id,))
+
+        if table_exists(db, "pub_markups"):
+            db.execute("DELETE FROM pub_markups WHERE pub_id IN (SELECT id FROM publications WHERE user_id = ?)", (user_id,))
+        if table_exists(db, "publication_items"):
+            db.execute("DELETE FROM publication_items WHERE publication_id IN (SELECT id FROM publications WHERE user_id = ?)", (user_id,))
+        if table_exists(db, "api_markups"):
+            db.execute("DELETE FROM api_markups WHERE client_id IN (SELECT id FROM api_clients WHERE user_id = ?)", (user_id,))
+
+        if table_exists(db, "excel_missing_sheets"):
+            db.execute("DELETE FROM excel_missing_sheets WHERE user_id = ?", (user_id,))
+        if table_exists(db, "excel_configs"):
+            db.execute("DELETE FROM excel_configs WHERE user_id = ?", (user_id,))
+        if table_exists(db, "interaction_bots"):
+            db.execute("DELETE FROM interaction_bots WHERE user_id = ?", (user_id,))
+        if table_exists(db, "api_sources"):
+            db.execute("DELETE FROM api_sources WHERE user_id = ?", (user_id,))
+        if table_exists(db, "api_clients"):
+            db.execute("DELETE FROM api_clients WHERE user_id = ?", (user_id,))
+
+        db.execute("DELETE FROM publications WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM tracked_chats WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM user_telegram_sessions WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM products WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM folders WHERE user_id = ?", (user_id,))
+        db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    socketio.emit('force_logout')
+    notify_clients()
+    return jsonify({'success': True})
+
+
 
 
 @app.route('/api/admin/clear_messages', methods=['POST'])
@@ -4131,39 +8595,210 @@ LOGIN_TEMPLATE = """
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Вход в систему</title>
     <style>
-        body { background: #1a1a1a; color: #e0e0e0; font-family: 'Segoe UI', Tahoma, Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .login-box { background: #2a2a2a; padding: 30px; border-radius: 8px; border: 1px solid #3a3a3a; text-align: center; width: 100%; max-width: 320px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
-        .login-box h2 { margin-bottom: 20px; color: #fff; }
-        input { width: 100%; padding: 12px; margin: 8px 0 16px 0; background: #1e1e1e; border: 1px solid #3a3a3a; color: #fff; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
-        input:focus { outline: none; border-color: #4a90e2; }
-        button { width: 100%; padding: 12px; background: #4a90e2; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 15px; transition: 0.2s; }
-        button:hover { background: #357abd; }
-        .error { color: #ff5555; background: rgba(255, 85, 85, 0.1); padding: 10px; border-radius: 4px; margin-bottom: 15px; font-size: 14px; border: 1px solid rgba(255, 85, 85, 0.3); }
-        
-        /* Новые стили для поля с паролем */
+        :root {
+            --accent-blue: #b8d8f5;
+            --panel-border: rgba(150, 180, 214, 0.18);
+            --text-soft: #bcc6d2;
+            --text-faint: #90a0b4;
+            --footer-bg:
+                radial-gradient(circle at center top, rgba(104, 107, 114, 0.16) 0%, rgba(39, 41, 47, 0.08) 28%, rgba(12, 13, 17, 0) 58%),
+                linear-gradient(90deg, #0a0b0f 0%, #171920 50%, #262932 100%);
+        }
+        html {
+            min-height: 100%;
+            background: #0b111a;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            color: #e0e0e0;
+            background-color: #0b111a;
+            background:
+                radial-gradient(circle at top center, rgba(72, 106, 156, 0.22) 0%, rgba(22, 35, 54, 0.90) 34%, rgba(10,16,25,1) 100%),
+                linear-gradient(180deg, #111820 0%, #0f1724 42%, #0b111a 100%);
+            background-repeat: no-repeat, no-repeat;
+            background-size: 160% 130%, 100% 100%;
+            background-position: center top, center top;
+            background-attachment: fixed, fixed;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+        }
+        .login-topbar {
+            background:
+                radial-gradient(circle at center top, rgba(104, 107, 114, 0.20) 0%, rgba(39, 41, 47, 0.12) 28%, rgba(12, 13, 17, 0) 58%),
+                linear-gradient(90deg, #0a0b0f 0%, #171920 50%, #262932 100%);
+            background-repeat: no-repeat, no-repeat;
+            background-size: 140% 120%, 100% 100%;
+            background-position: center top, center top;
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+            box-shadow: inset 0 -1px 0 rgba(255,255,255,0.04), 0 14px 30px rgba(0,0,0,0.34);
+        }
+        .login-topbar-inner {
+            max-width: 1400px;
+            margin: 0 auto;
+            min-height: 84px;
+            padding: 0 28px;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .login-topbar img {
+            height: 48px;
+            width: auto;
+            display: block;
+        }
+        .login-topbar-text {
+            color: #d3d5da;
+            font-size: 18px;
+            font-weight: 600;
+        }
+        .login-shell {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px 20px;
+            min-height: calc(100vh - 84px - 64px);
+        }
+        .login-box {
+            width: 100%;
+            max-width: 420px;
+            padding: 30px 30px 26px;
+            border-radius: 20px;
+            border: 1px solid var(--panel-border);
+            background: linear-gradient(180deg, rgba(29, 42, 61, 0.98) 0%, rgba(20, 31, 47, 0.98) 100%);
+            box-shadow: 0 24px 60px rgba(0,0,0,0.30);
+        }
+        .login-box h2 {
+            margin: 0 0 8px;
+            color: var(--accent-blue);
+            font-size: 22px;
+            font-weight: 800;
+            text-align: center;
+        }
+        .login-subtitle {
+            margin: 0 0 22px;
+            color: var(--text-soft);
+            font-size: 14px;
+            text-align: center;
+            font-weight: 600;
+        }
+        input {
+            width: 100%;
+            padding: 13px 14px;
+            margin: 8px 0 16px 0;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.10);
+            color: #fff;
+            border-radius: 10px;
+            font-size: 14px;
+            outline: none;
+        }
+        input::placeholder {
+            color: var(--text-faint);
+        }
+        input:focus {
+            border-color: rgba(184, 216, 245, 0.42);
+            box-shadow: 0 0 0 3px rgba(184, 216, 245, 0.10);
+        }
+        button {
+            width: 100%;
+            padding: 13px 14px;
+            background:
+                radial-gradient(circle at center top, rgba(104, 107, 114, 0.12) 0%, rgba(39, 41, 47, 0.08) 28%, rgba(12, 13, 17, 0) 58%),
+                linear-gradient(90deg, #171920 0%, #22252d 50%, #2b2f38 100%);
+            color: #cfd3da;
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 10px;
+            cursor: pointer;
+            font-weight: 700;
+            font-size: 15px;
+            transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+        }
+        button:hover {
+            background:
+                radial-gradient(circle at center top, rgba(116, 120, 128, 0.14) 0%, rgba(48, 50, 58, 0.10) 28%, rgba(12, 13, 17, 0) 58%),
+                linear-gradient(90deg, #1b1d24 0%, #262932 50%, #323742 100%);
+            border-color: rgba(255,255,255,0.16);
+            color: #dce0e7;
+        }
+        .error {
+            color: #ffd2d0;
+            background: rgba(231, 98, 95, 0.14);
+            padding: 10px 12px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+            font-size: 14px;
+            border: 1px solid rgba(231, 98, 95, 0.24);
+        }
         .password-container { position: relative; margin: 8px 0 16px 0; }
-        .password-container input { margin: 0; padding-right: 40px; } /* Отступ справа, чтобы текст не залезал под иконку */
-        .toggle-password { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); cursor: pointer; color: #888; font-size: 18px; user-select: none; }
+        .password-container input { margin: 0; padding-right: 40px; }
+        .toggle-password {
+            position: absolute;
+            right: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            cursor: pointer;
+            color: var(--text-faint);
+            font-size: 18px;
+            user-select: none;
+        }
+        .login-footer {
+            background: var(--footer-bg);
+            background-repeat: no-repeat, no-repeat;
+            background-size: 140% 120%, 100% 100%;
+            background-position: center top, center top;
+            border-top: 1px solid rgba(255,255,255,0.08);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+        }
+        .login-footer-inner {
+            max-width: 1400px;
+            min-height: 64px;
+            margin: 0 auto;
+            padding: 0 28px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-faint);
+            font-size: 14px;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
-    <div class="login-box">
-        <h2>Вход в систему</h2>
-        {% if error %}
-            <div class="error">{{ error }}</div>
-        {% endif %}
-        <form action="/login" method="POST">
-            <input type="text" name="login" placeholder="Логин" required>
-            
-            <div class="password-container">
-                <input type="password" id="login-password" name="password" placeholder="Пароль" required>
-                <span class="toggle-password" onclick="togglePassword(this)"></span>
-            </div>
+    <div class="login-topbar">
+        <div class="login-topbar-inner">
+            <img src="/logo.svg?v=3" alt="a:store">
+            <span class="login-topbar-text">direct</span>
+        </div>
+    </div>
+    <div class="login-shell">
+        <div class="login-box">
+            <h2>Вход в систему</h2>
+            <p class="login-subtitle">Авторизация в рабочем интерфейсе a:store direct</p>
+            {% if error %}
+                <div class="error">{{ error }}</div>
+            {% endif %}
+            <form action="/login" method="POST">
+                <input type="text" name="login" placeholder="Логин" required>
+                
+                <div class="password-container">
+                    <input type="password" id="login-password" name="password" placeholder="Пароль" required>
+                    <span class="toggle-password" onclick="togglePassword(this)"></span>
+                </div>
 
-            <button type="submit">Войти</button>
-        </form>
+                <button type="submit">Вход</button>
+            </form>
+        </div>
+    </div>
+    <div class="login-footer">
+        <div class="login-footer-inner">© astore, 2022-2026. Все права защищены.</div>
     </div>
 
     <script>
@@ -4227,11 +8862,12 @@ def fix_db():
                 chat_title TEXT,
                 is_blocked INTEGER DEFAULT 0,
                 sender_name TEXT,
+                is_delayed INTEGER DEFAULT 0,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
                 UNIQUE(chat_id, telegram_message_id)
             );
-            INSERT OR IGNORE INTO messages_new (id, user_id, telegram_message_id, type, text, date, chat_id, chat_title, is_blocked, sender_name)
-            SELECT id, user_id, telegram_message_id, type, text, date, chat_id, chat_title, is_blocked, sender_name FROM messages;
+            INSERT OR IGNORE INTO messages_new (id, user_id, telegram_message_id, type, text, date, chat_id, chat_title, is_blocked, sender_name, is_delayed)
+            SELECT id, user_id, telegram_message_id, type, text, date, chat_id, chat_title, is_blocked, sender_name, 0 FROM messages;
             DROP TABLE messages;
             ALTER TABLE messages_new RENAME TO messages;
         ''')
@@ -4406,7 +9042,7 @@ def public_api_catalog():
     # Используем подзапросы, чтобы сразу вытащить последнюю подтвержденную цену
     products_raw = db.execute("""
         SELECT p.id, p.name, p.folder_id, p.price as manual_price, p.photo_url, p.brand, p.country, p.weight, p.model_number, p.is_on_request,
-               p.color, p.storage, p.ram, p.warranty, p.description, p.specs,
+               p.color, p.storage, p.ram, p.warranty, p.description, p.description_html, p.specs,
                (SELECT pm.extracted_price FROM product_messages pm JOIN messages m ON pm.message_id = m.id 
                 WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as parsed_price,
                (SELECT pm.is_actual FROM product_messages pm JOIN messages m ON pm.message_id = m.id 
@@ -4476,12 +9112,7 @@ def public_api_catalog():
             ]
 
         # 6. Обработка технических характеристик (specs)
-        specs_data = {}
-        if p['specs']:
-            try:
-                specs_data = json.loads(p['specs'])
-            except:
-                specs_data = {}
+        specs_data = parse_specs_payload(p['specs'], p)
 
         # 7. Формируем финальный объект товара
         products.append({
@@ -4503,6 +9134,7 @@ def public_api_catalog():
             'ram': p['ram'],
             'warranty': p['warranty'],
             'description': p['description'],
+            'description_html': p['description_html'],
             'specs': specs_data
         })
         
@@ -4870,7 +9502,7 @@ def delete_excel_config(config_id):
 import sqlite3
 
 def update_database():
-    conn = sqlite3.connect('app.db')
+    conn = sqlite3.connect(app.config['DATABASE'])
     cursor = conn.cursor()
     
     print("Начинаю проверку базы данных...")
@@ -5067,26 +9699,148 @@ def delayed_messages_scheduler():
             
         time.sleep(60) # Проверяем тайминги каждую минуту
 
+
+def process_pending_ai_repair_jobs():
+    with app.app_context():
+        db = get_db()
+        jobs = db.execute(
+            """
+            SELECT *
+            FROM ai_repair_jobs
+            WHERE status IN ('pending', 'retry_wait')
+              AND next_retry_at <= CURRENT_TIMESTAMP
+            ORDER BY created_at
+            LIMIT ?
+            """,
+            (AI_REPAIR_JOB_BATCH_SIZE,),
+        ).fetchall()
+
+        for job in jobs:
+            db.execute(
+                "UPDATE ai_repair_jobs SET status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (job["id"],),
+            )
+            db.commit()
+
+            product_row = db.execute(
+                "SELECT * FROM products WHERE id = ? AND user_id = ?",
+                (job["product_id"], job["user_id"]),
+            ).fetchone()
+            if not product_row:
+                db.execute(
+                    """
+                    UPDATE ai_repair_jobs
+                    SET status = 'failed', last_error = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    ("Товар удален или недоступен", job["id"]),
+                )
+                db.commit()
+                continue
+
+            product_name = str(job["product_name"] or product_row["name"] or "").strip()
+            article = str(job["article"] or product_row["model_number"] or "").strip()
+            preferred_folder_id = normalize_folder_id(job["preferred_folder_id"])
+
+            try:
+                payload, _ = get_or_generate_autofill_payload(
+                    db,
+                    job["user_id"],
+                    product_name,
+                    article,
+                    use_cache=True,
+                )
+                upsert_product_from_autofill(
+                    db,
+                    job["user_id"],
+                    product_row,
+                    payload,
+                    preferred_folder_id if preferred_folder_id is not None else product_row["folder_id"],
+                )
+                db.execute(
+                    """
+                    UPDATE ai_repair_jobs
+                    SET status = 'completed', attempts = attempts + 1, last_error = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (job["id"],),
+                )
+                db.commit()
+                notify_clients()
+            except Exception as e:
+                attempts = int(job["attempts"] or 0) + 1
+                if is_retryable_ai_error(e):
+                    retry_delay_seconds = compute_ai_retry_delay_seconds(attempts)
+                    db.execute(
+                        """
+                        UPDATE ai_repair_jobs
+                        SET status = 'retry_wait',
+                            attempts = ?,
+                            last_error = ?,
+                            next_retry_at = datetime('now', '+' || ? || ' seconds'),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (attempts, str(e)[:1000], retry_delay_seconds, job["id"]),
+                    )
+                else:
+                    db.execute(
+                        """
+                        UPDATE ai_repair_jobs
+                        SET status = 'failed', attempts = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (attempts, str(e)[:1000], job["id"]),
+                    )
+                db.commit()
+
+
+def ai_repair_scheduler():
+    while True:
+        try:
+            process_pending_ai_repair_jobs()
+        except Exception as e:
+            logger.error(f"Ошибка AI-планировщика исправлений: {e}")
+        time.sleep(60)
+
+
+def warm_product_search_cache():
+    try:
+        with app.app_context():
+            db = get_db()
+            rows = db.execute("SELECT id FROM users ORDER BY id").fetchall()
+            for row in rows:
+                get_cached_product_search_entries(db, int(row['id']))
+            logger.info("Product search cache warmed")
+    except Exception as e:
+        logger.error(f"Ошибка прогрева кеша поиска товаров: {e}")
+
+
+_background_schedulers_started = False
+
+
+def start_background_schedulers():
+    global _background_schedulers_started
+    if _background_schedulers_started:
+        return
+    threading.Thread(target=publish_scheduler, daemon=True).start()
+    threading.Thread(target=api_parser_scheduler, daemon=True).start()
+    threading.Thread(target=delayed_messages_scheduler, daemon=True).start()
+    threading.Thread(target=ai_repair_scheduler, daemon=True).start()
+    threading.Thread(target=bot_interaction_scheduler, daemon=True).start()
+    threading.Thread(target=warm_product_search_cache, daemon=True).start()
+    _background_schedulers_started = True
+
 # ---------- Запуск приложения ----------
 
 if __name__ == '__main__':
     update_database()
-    threading.Thread(target=publish_scheduler, daemon=True).start()
-    threading.Thread(target=api_parser_scheduler, daemon=True).start()
-    threading.Thread(target=delayed_messages_scheduler, daemon=True).start()
+    start_background_schedulers()
     
     with app.app_context():
         db = get_db()
         cursor = db.execute("SELECT id, user_id, api_id, api_hash FROM user_telegram_sessions WHERE status = 'active'")
         for row in cursor.fetchall():
             start_message_listener(row['id'], row['user_id'], row['api_id'], row['api_hash'])
-    # Запускаем планировщик взаимодействия с ботами
-    threading.Thread(target=bot_interaction_scheduler, daemon=True).start()
-    socketio.run(
-        app,
-        debug=FLASK_DEBUG,
-        host=FLASK_HOST,
-        port=FLASK_PORT,
-        use_reloader=False,
-        allow_unsafe_werkzeug=True,
-    )
+    port = int(os.environ.get('PORT', '5001'))
+    socketio.run(app, debug=True, host='0.0.0.0', port=port, use_reloader=False, allow_unsafe_werkzeug=True)

@@ -8737,10 +8737,10 @@ LOGIN_TEMPLATE = """
         }
         .login-topbar img {
             display: block;
-            width: 72px;
+            width: 192px;
             height: 46px;
             object-fit: contain;
-            flex: 0 0 72px;
+            flex: 0 0 192px;
         }
         .login-topbar-text {
             color: #c9cacf;
@@ -8866,7 +8866,7 @@ LOGIN_TEMPLATE = """
 <body>
     <div class="login-topbar">
         <div class="login-topbar-inner">
-            <img src="/logo.svg?v=6" alt="a:store">
+            <img src="/logo.svg?v=7" alt="a:store">
             <span class="login-topbar-text">direct</span>
         </div>
     </div>

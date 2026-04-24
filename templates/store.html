@@ -175,7 +175,7 @@
             align-items: center;
             gap: 12px;
             flex: 0 0 auto;
-            min-width: 220px;
+            min-width: 250px;
             cursor: pointer;
             user-select: none;
             -webkit-user-select: none;
@@ -184,10 +184,10 @@
         }
         .top-brand img {
             display: block;
-            width: 72px;
+            width: 192px;
             height: 46px;
             object-fit: contain;
-            flex: 0 0 72px;
+            flex: 0 0 192px;
         }
         .top-brand-text {
             user-select: none;
@@ -4576,9 +4576,9 @@
                 flex-basis: auto;
             }
             .top-brand img {
-                width: 58px;
+                width: 154px;
                 height: 38px;
-                flex-basis: 58px;
+                flex-basis: 154px;
             }
             .content-area {
                 max-width: 100%;
@@ -4857,7 +4857,7 @@
     <div class="top-menu-wrapper">
     <div class="top-menu">
         <div class="top-brand" id="top-brand-home" role="button" tabindex="0" aria-label="Открыть главную страницу">
-            <img src="/logo.svg?v=6" alt="a:store">
+            <img src="/logo.svg?v=7" alt="a:store">
             <span class="top-brand-text">direct</span>
         </div>
         <div class="top-menu-nav">
@@ -6195,13 +6195,13 @@
          // Добавьте эту строку
          
 let expandedFolders = new Set(JSON.parse(localStorage.getItem('expandedFolders') || '[]'));
-const PRODUCTS_UI_STATE_VERSION = 'v4';
+const PRODUCTS_UI_STATE_VERSION = 'v5';
 const API_UI_STATE_KEY = 'apiUiStateV1';
 const API_CLIENTS_CACHE_KEY = 'apiClientsCacheV1';
 const SECTION_SNAPSHOT_KEY = 'sectionSnapshotV1';
 const PARSER_MESSAGES_CACHE_KEY = 'parserMessagesCacheV1';
-const SHARED_API_CACHE_KEY = 'sharedApiCacheV2';
-const PARSER_SECTION_CACHE_KEY = 'parserSectionCacheV2';
+const SHARED_API_CACHE_KEY = 'sharedApiCacheV3';
+const PARSER_SECTION_CACHE_KEY = 'parserSectionCacheV3';
 
         let currentProductFolderView = 'all'; // Текущий фильтр папки для товаров
         let currentProductBrowserPath = [];
@@ -8858,7 +8858,6 @@ function renderProductFoldersTree(folders) {
         ? [...currentProductBrowserPath]
         : getFolderNavigationPath(folders, currentProductFolderView);
     let visibleFolders = getCleanFoldersAtPath(folders, effectiveBrowserPath);
-    let renderedBrowserPath = [...effectiveBrowserPath];
     let currentPathText = getFolderPathNames(productsFolderTreeData, effectiveBrowserPath).join(' / ');
     const folderCounts = productsFolderCounts;
     const searchQuery = String(searchInput?.value ?? currentProductFolderSearchQuery ?? '').trim().toLowerCase();
@@ -8870,12 +8869,6 @@ function renderProductFoldersTree(folders) {
 
     currentProductBrowserPath = [...effectiveBrowserPath];
     currentPathText = getFolderPathNames(productsFolderTreeData, currentProductBrowserPath).join(' / ');
-
-    if (!searchQuery && !effectiveBrowserPath.length && visibleFolders.length === 1 && visibleFolders[0]?.children?.length) {
-        renderedBrowserPath = [Number(visibleFolders[0].id)];
-        visibleFolders = getCleanFoldersAtPath(folders, renderedBrowserPath);
-        currentPathText = getFolderPathNames(productsFolderTreeData, renderedBrowserPath).join(' / ');
-    }
 
     if (searchQuery) {
         if (normalizeProductSearchText(searchQuery).length < 2) {
@@ -8943,7 +8936,7 @@ function renderProductFoldersTree(folders) {
     rows.push(...visibleFolders.map(folder => `
         <li data-id="${folder.id}" class="${String(currentProductFolderView) === String(folder.id) ? 'active' : ''}">
             <div class="folder-row" data-folder-id="${folder.id}">
-                ${getFolderLeadingMarkup(folder.name, renderedBrowserPath.length, currentPathText)}
+                ${getFolderLeadingMarkup(folder.name, effectiveBrowserPath.length, currentPathText)}
                 <div class="folder-text">
                     <span class="folder-name" title="${escapeHtml(formatProductFolderLabel(folder.name))}">${escapeHtml(formatProductFolderLabel(folder.name))}</span>
                 </div>
@@ -8992,8 +8985,8 @@ function renderProductFoldersTree(folders) {
 
             currentProductFolderView = folder.id;
             currentProductBrowserPath = folder.children?.length
-                ? [...renderedBrowserPath, folder.id]
-                : [...renderedBrowserPath];
+                ? [...currentProductBrowserPath, folder.id]
+                : [...currentProductBrowserPath];
             productsCurrentPage = 1;
             saveProductsUiState();
             loadProducts();
@@ -9990,9 +9983,9 @@ let productsPerPage = 5;
 const PRODUCT_SERVER_SEARCH_ENABLED = false;
 const PRODUCTS_SUMMARY_ENDPOINT = '/api/products?compact=1';
 const PRODUCTS_CONNECTED_SUMMARY_ENDPOINT = '/api/products?compact=1&connected_only=1';
-const PRODUCTS_SECTION_CACHE_KEY = 'productsSectionCacheV3';
-const PRODUCTS_DOM_CACHE_KEY = 'productsDomCacheV3';
-const PARSER_DOM_CACHE_KEY = 'parserDomCacheV2';
+const PRODUCTS_SECTION_CACHE_KEY = 'productsSectionCacheV4';
+const PRODUCTS_DOM_CACHE_KEY = 'productsDomCacheV4';
+const PARSER_DOM_CACHE_KEY = 'parserDomCacheV3';
 
 function readProductsSectionCache() {
     try {

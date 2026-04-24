@@ -6183,7 +6183,7 @@
             .replace(/'/g, "&#039;");
     }
     let currentPage = 1;
-    let currentLimit = 5; // Дефолт 5
+    let currentLimit = Math.max(20, parseInt(localStorage.getItem('parserMessagesLimit') || '20', 10) || 20);
     const applyBtn = document.getElementById('apply-filters');
     const messagesTbody = document.getElementById('messages-tbody');
     const noMessagesDiv = document.getElementById('no-messages');
@@ -6202,6 +6202,11 @@ const SECTION_SNAPSHOT_KEY = 'sectionSnapshotV1';
 const PARSER_MESSAGES_CACHE_KEY = 'parserMessagesCacheV1';
 const SHARED_API_CACHE_KEY = 'sharedApiCacheV3';
 const PARSER_SECTION_CACHE_KEY = 'parserSectionCacheV3';
+let parserMessagesRequestController = null;
+let parserMessagesRequestSequence = 0;
+let parserMessagesIsLoading = false;
+let parserMessagesPendingRefresh = false;
+let parserMessagesLastRenderedKey = '';
 
         let currentProductFolderView = 'all'; // Текущий фильтр папки для товаров
         let currentProductBrowserPath = [];
@@ -11597,7 +11602,48 @@ document.addEventListener('change', (event) => {
             searchInputEl.focus();
             scheduleParserLiveSearch({ immediate: true });
         });
-function loadMessages(page = 1) { 
+function buildParserMessagesRenderKey(data) {
+    const messages = Array.isArray(data?.messages) ? data.messages : [];
+    const ids = messages.map(msg => `${msg.id || 'x'}:${msg.date || msg.timestamp || ''}`).join('|');
+    return `${data?.page || 1}:${data?.total || 0}:${data?.total_pages || 1}:${ids}`;
+}
+
+function hasActiveParserFilters() {
+    const searchInput = document.getElementById('filter-search-input');
+    const excludeInput = document.getElementById('filter-exclude-input');
+    const senderSelect = document.getElementById('filter-sender');
+    const typeSelect = document.getElementById('filter-type');
+
+    return Boolean(
+        searchWords.length ||
+        excludeWords.length ||
+        searchInput?.value.trim() ||
+        excludeInput?.value.trim() ||
+        (senderSelect && senderSelect.value && senderSelect.value !== 'all') ||
+        (typeSelect && typeSelect.value && typeSelect.value !== 'all')
+    );
+}
+
+function queueParserMessagesRefresh(page = currentPage) {
+    if (!isParserWorkspaceVisible() || currentView !== 'inbox') return;
+    if (hasActiveParserFilters()) return;
+
+    const activeElement = document.activeElement;
+    if (activeElement && ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeElement.tagName)) {
+        const parserScope = document.getElementById('parser-section');
+        if (parserScope?.contains(activeElement)) return;
+    }
+
+    if (parserMessagesIsLoading) {
+        parserMessagesPendingRefresh = true;
+        return;
+    }
+
+    loadMessages(page, { background: true, preferCache: false });
+}
+
+function loadMessages(page = 1, options = {}) { 
+    const { background = false, preferCache = !background } = options;
     currentPage = page; 
     let searchInput = document.getElementById('filter-search-input');
     let search = searchInput ? searchInput.value : ''; 
@@ -11633,30 +11679,51 @@ function loadMessages(page = 1) {
         }
     };
 
-    if (window.apiCache && window.apiCache[url]) { 
+    if (window.apiCache && window.apiCache[url] && preferCache) { 
         renderMessagesData(window.apiCache[url]); 
         return;
     } 
 
     const cachedPayload = readParserMessagesCache();
-    if (cachedPayload?.url === url && cachedPayload?.payload) {
+    if (preferCache && cachedPayload?.url === url && cachedPayload?.payload) {
         renderMessagesData(cachedPayload.payload);
     }
 
     // Добавляем метку времени, чтобы обмануть кэш браузера
     let fetchUrl = url + `&_t=${new Date().getTime()}`;
+    const requestId = ++parserMessagesRequestSequence;
+    if (parserMessagesRequestController) {
+        parserMessagesRequestController.abort();
+    }
+    parserMessagesRequestController = new AbortController();
+    parserMessagesIsLoading = true;
 
-    fetch(fetchUrl, { cache: 'no-store' }) 
+    fetch(fetchUrl, { cache: 'no-store', signal: parserMessagesRequestController.signal }) 
         .then(response => response.json()) 
         .then(data => {
+            if (requestId !== parserMessagesRequestSequence) return;
             if (window.apiCache) window.apiCache[url] = data; 
             persistParserMessagesCache(data);
-            renderMessagesData(data); 
+            const nextRenderKey = buildParserMessagesRenderKey(data);
+            if (!background || nextRenderKey !== parserMessagesLastRenderedKey) {
+                renderMessagesData(data);
+                parserMessagesLastRenderedKey = nextRenderKey;
+            }
         }) 
         .catch(err => { 
+            if (err?.name === 'AbortError') return;
             console.error("Ошибка загрузки сообщений:", err); 
             let container = document.getElementById('messages-container');
             if(container) container.innerHTML = '<p style="color:red; text-align:center;">Ошибка загрузки сообщений.</p>'; 
+        })
+        .finally(() => {
+            if (requestId !== parserMessagesRequestSequence) return;
+            parserMessagesIsLoading = false;
+            parserMessagesRequestController = null;
+            if (parserMessagesPendingRefresh) {
+                parserMessagesPendingRefresh = false;
+                queueParserMessagesRefresh(currentPage);
+            }
         });
 }
 
@@ -11734,8 +11801,6 @@ function renderPagination(total, page, totalPages) {
             <div class="pager-left">
                 <span class="pager-label">Показывать по:</span>
                 <select onchange="changeLimit(this.value)" class="pager-select">
-                    <option value="5" ${currentLimit === 5 ? 'selected' : ''}>5</option>
-                    <option value="10" ${currentLimit === 10 ? 'selected' : ''}>10</option>
                     <option value="20" ${currentLimit === 20 ? 'selected' : ''}>20</option>
                     <option value="50" ${currentLimit === 50 ? 'selected' : ''}>50</option>
                     <option value="100" ${currentLimit === 100 ? 'selected' : ''}>100</option>
@@ -11769,7 +11834,8 @@ function renderPagination(total, page, totalPages) {
 
 // 5. Функция смены лимита сообщений
 function changeLimit(newLimit) {
-    currentLimit = parseInt(newLimit);
+    currentLimit = Math.max(20, parseInt(newLimit, 10) || 20);
+    localStorage.setItem('parserMessagesLimit', String(currentLimit));
     // При изменении лимита (например, с 20 на 100) обязательно сбрасываем на 1-ю страницу
     loadMessages(1); 
 }
@@ -11955,6 +12021,7 @@ function renderMessagesData(data) {
     
     container.innerHTML = html;
     syncSelectedMessagesUi();
+    parserMessagesLastRenderedKey = buildParserMessagesRenderKey(data);
     
     // --- 3. ПАГИНАЦИЯ ---
     if (typeof renderPagination === 'function') {
@@ -13936,7 +14003,7 @@ function startPolling() {
     if (!isParserWorkspaceVisible()) return;
     if (typeof currentView !== 'undefined') { 
         if (currentView === 'inbox' && typeof loadMessages === 'function') {
-            loadMessages(typeof currentPage !== 'undefined' ? currentPage : 1);
+            queueParserMessagesRefresh(typeof currentPage !== 'undefined' ? currentPage : 1);
         } else if (typeof loadFolderCatalog === 'function') {
             loadFolderCatalog(currentView === 'catalog' ? 'catalog' : currentView); 
         }
@@ -13961,7 +14028,7 @@ socket.on('db_updated', function(data) {
         if (typeof currentView !== 'undefined') { 
             if (document.getElementById('parser-section').style.display === 'block') { 
                 if (currentView === 'inbox' && typeof loadMessages === 'function') {
-                    loadMessages(typeof currentPage !== 'undefined' ? currentPage : 1);
+                    queueParserMessagesRefresh(typeof currentPage !== 'undefined' ? currentPage : 1);
                 }
             } 
         }

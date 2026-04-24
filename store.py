@@ -7275,14 +7275,25 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                 except Exception:
                     pass
                 
-                # 4. === ЗАЩИТА СТАТУСА: Сбрасываем статус на "выключен", если поток упал ===
+                # 4. Если поток завершился без отзыва авторизации, мягко переводим аккаунт в inactive.
+                # Для слетевшей сессии уже должен остаться статус unauthorized, чтобы можно было переавторизоваться
+                # без потери связей, настроек и записей в базе.
                 try:
                     with app.app_context():
                         local_db = get_db()
-                        local_db.execute("UPDATE user_telegram_sessions SET status = 'inactive' WHERE id = ?", (session_id,))
-                        local_db.commit()
-                        if 'notify_clients' in globals(): 
-                            notify_clients()
+                        current_row = local_db.execute(
+                            "SELECT status FROM user_telegram_sessions WHERE id = ?",
+                            (session_id,)
+                        ).fetchone()
+                        current_status = current_row['status'] if current_row else None
+                        if current_status == 'active':
+                            local_db.execute(
+                                "UPDATE user_telegram_sessions SET status = 'inactive' WHERE id = ?",
+                                (session_id,)
+                            )
+                            local_db.commit()
+                            if 'notify_clients' in globals():
+                                notify_clients()
                 except Exception as e:
                     logging.error(f"Не удалось сбросить статус сессии {session_id} в БД: {e}")
                 # ===========================================================================

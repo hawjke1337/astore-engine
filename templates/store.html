@@ -5657,7 +5657,7 @@
             <div id="userbots-section" style="display: none;">
                 <div class="userbots-toolbar">
                     <h2>Управление акаунтами</h2>
-                    <button id="add-userbot-btn" type="button" class="save-btn with-icon" onclick="window.openUserbotForm && window.openUserbotForm()">
+                    <button id="add-userbot-btn" type="button" class="save-btn with-icon" onclick="(function(){const form=document.getElementById('bot-form-container');const sessionInput=document.getElementById('auth_session_id');const qrContainer=document.getElementById('qr-container');const qrImage=document.getElementById('qr-image');const qrStatus=document.getElementById('qr-status');if(!form)return;form.style.display='block';if(sessionInput)sessionInput.value='';if(qrContainer)qrContainer.style.display='none';if(qrImage)qrImage.innerHTML='';if(qrStatus)qrStatus.innerText='Отсканируйте QR в Telegram (Настройки -> Устройства -> Сканировать QR)';form.scrollIntoView({behavior:'smooth',block:'center'});})();">
                         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
                         <span>Добавить акаунт</span>
                     </button>

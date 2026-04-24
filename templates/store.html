@@ -5668,7 +5668,7 @@
                 <div style="display:flex; gap:8px; margin-bottom:16px;">
                     <input type="text" id="new-chat-id" placeholder="ID или ссылка" style="flex:1; background:#1e1e1e; border:1px solid #3a3a3a; color:#fff; padding:8px;">
                     <input type="text" id="new-chat-name" placeholder="Название (для вас)" style="flex:1; background:#1e1e1e; border:1px solid #3a3a3a; color:#fff; padding:8px;">
-                    <button id="add-chat-btn" class="graphite-btn">Добавить</button>
+                    <button id="add-chat-btn" type="button" class="graphite-btn" onclick="window.handleAddTrackedChat && window.handleAddTrackedChat()">Добавить</button>
                 </div>
                 <ul id="tracked-chats-list" style="list-style:none;"></ul>
 
@@ -7432,7 +7432,7 @@ async function restoreProductBindingDraft() {
         }
 
         function saveSectionSnapshot(sectionId = activeMainSection) {
-            if (sectionId === 'products') return;
+            if (sectionId === 'products' || sectionId === 'userbots' || sectionId === 'interaction_bots') return;
             const node = getSectionSnapshotNode(sectionId);
             if (!node) return;
             try {
@@ -7451,7 +7451,7 @@ async function restoreProductBindingDraft() {
         }
 
         function restoreSectionSnapshot(sectionId) {
-            if (sectionId === 'products') return null;
+            if (sectionId === 'products' || sectionId === 'userbots' || sectionId === 'interaction_bots') return null;
             try {
                 const raw = sessionStorage.getItem(SECTION_SNAPSHOT_KEY);
                 if (!raw) return null;
@@ -12436,7 +12436,7 @@ document.querySelectorAll('.delete-chat').forEach(btn => {
 
         
 
-        document.getElementById('add-chat-btn')?.addEventListener('click', async () => {
+        window.handleAddTrackedChat = async function() {
             const chatId = document.getElementById('new-chat-id').value.trim();
             const customName = document.getElementById('new-chat-name').value.trim(); // Получаем кастомное имя
             if (!chatId) return;
@@ -12456,7 +12456,9 @@ document.querySelectorAll('.delete-chat').forEach(btn => {
             } catch (error) {
                 console.log("Добавление отменено:", error.message);
             }
-        });
+        };
+
+        document.getElementById('add-chat-btn')?.addEventListener('click', window.handleAddTrackedChat);
 
         
 

@@ -9464,7 +9464,6 @@ function activateHomeSection() {
             const addBotBtn = document.getElementById('add-bot-btn');
             if (data.authorized) {
                 if (addBotBtn) addBotBtn.style.display = 'none';
-                document.getElementById('bot-form-container').style.display = 'none';
             } else {
                 if (addBotBtn) addBotBtn.style.display = 'block';
             }
@@ -9482,8 +9481,20 @@ function activateHomeSection() {
         if (addUserbotBtn) {
             addUserbotBtn.addEventListener('click', () => {
                 const form = document.getElementById('bot-form-container');
-                form.style.display = form.style.display === 'none' || form.style.display === '' ? 'block' : 'none';
-                form.scrollIntoView({ behavior: 'smooth' }); // Плавно прокручиваем к форме
+                const sessionInput = document.getElementById('auth_session_id');
+                const qrContainer = document.getElementById('qr-container');
+                const qrImage = document.getElementById('qr-image');
+                const qrStatus = document.getElementById('qr-status');
+                if (!form) return;
+
+                form.style.display = 'block';
+                if (sessionInput) sessionInput.value = '';
+                if (qrContainer) qrContainer.style.display = 'none';
+                if (qrImage) qrImage.innerHTML = '';
+                if (qrStatus) {
+                    qrStatus.innerText = 'Отсканируйте QR в Telegram (Настройки -> Устройства -> Сканировать QR)';
+                }
+                form.scrollIntoView({ behavior: 'smooth', block: 'center' });
             });
         }
 

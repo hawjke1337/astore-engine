@@ -175,12 +175,19 @@
             align-items: center;
             gap: 12px;
             flex: 0 0 auto;
-            min-width: 190px;
+            min-width: 220px;
             cursor: pointer;
             user-select: none;
             -webkit-user-select: none;
             -webkit-touch-callout: none;
             transition: none;
+        }
+        .top-brand img {
+            display: block;
+            width: 72px;
+            height: 46px;
+            object-fit: contain;
+            flex: 0 0 72px;
         }
         .top-brand-text {
             user-select: none;
@@ -192,9 +199,9 @@
             transform: none;
         }
         .top-brand-text {
-            color: #eef3f8;
-            font-size: 20px;
-            font-weight: 800;
+            color: #c9cacf;
+            font-size: 17px;
+            font-weight: 700;
             letter-spacing: 0;
             flex: 0 0 auto;
             white-space: nowrap;
@@ -4568,6 +4575,11 @@
                 min-width: 0;
                 flex-basis: auto;
             }
+            .top-brand img {
+                width: 58px;
+                height: 38px;
+                flex-basis: 58px;
+            }
             .content-area {
                 max-width: 100%;
                 padding: 16px;
@@ -4604,7 +4616,7 @@
                 gap: 8px;
             }
             .top-brand-text {
-                font-size: 18px;
+                font-size: 15px;
             }
             .logout-btn {
                 width: 38px;
@@ -4780,7 +4792,7 @@
                 padding-right: max(10px, env(safe-area-inset-right));
             }
             .top-brand-text {
-                font-size: 16px;
+                font-size: 14px;
             }
             .content-area {
                 padding: 10px;
@@ -4845,7 +4857,8 @@
     <div class="top-menu-wrapper">
     <div class="top-menu">
         <div class="top-brand" id="top-brand-home" role="button" tabindex="0" aria-label="Открыть главную страницу">
-            <span class="top-brand-text">Astore Engine</span>
+            <img src="/logo.svg?v=6" alt="a:store">
+            <span class="top-brand-text">direct</span>
         </div>
         <div class="top-menu-nav">
         <ul class="menu-items" id="main-menu">
@@ -6156,7 +6169,7 @@
     </div>
     <footer class="app-footer">
         <div class="app-footer-inner">
-            <div class="app-footer-copy">© Astore Engine, <span id="footer-year-range">2022-2026</span>. Все права защищены.</div>
+            <div class="app-footer-copy">© astore, <span id="footer-year-range">2022-2026</span>. Все права защищены.</div>
         </div>
     </footer>
     <script>
@@ -6182,13 +6195,13 @@
          // Добавьте эту строку
          
 let expandedFolders = new Set(JSON.parse(localStorage.getItem('expandedFolders') || '[]'));
-const PRODUCTS_UI_STATE_VERSION = 'v3';
+const PRODUCTS_UI_STATE_VERSION = 'v4';
 const API_UI_STATE_KEY = 'apiUiStateV1';
 const API_CLIENTS_CACHE_KEY = 'apiClientsCacheV1';
 const SECTION_SNAPSHOT_KEY = 'sectionSnapshotV1';
 const PARSER_MESSAGES_CACHE_KEY = 'parserMessagesCacheV1';
-const SHARED_API_CACHE_KEY = 'sharedApiCacheV1';
-const PARSER_SECTION_CACHE_KEY = 'parserSectionCacheV1';
+const SHARED_API_CACHE_KEY = 'sharedApiCacheV2';
+const PARSER_SECTION_CACHE_KEY = 'parserSectionCacheV2';
 
         let currentProductFolderView = 'all'; // Текущий фильтр папки для товаров
         let currentProductBrowserPath = [];
@@ -8845,6 +8858,7 @@ function renderProductFoldersTree(folders) {
         ? [...currentProductBrowserPath]
         : getFolderNavigationPath(folders, currentProductFolderView);
     let visibleFolders = getCleanFoldersAtPath(folders, effectiveBrowserPath);
+    let renderedBrowserPath = [...effectiveBrowserPath];
     let currentPathText = getFolderPathNames(productsFolderTreeData, effectiveBrowserPath).join(' / ');
     const folderCounts = productsFolderCounts;
     const searchQuery = String(searchInput?.value ?? currentProductFolderSearchQuery ?? '').trim().toLowerCase();
@@ -8856,6 +8870,12 @@ function renderProductFoldersTree(folders) {
 
     currentProductBrowserPath = [...effectiveBrowserPath];
     currentPathText = getFolderPathNames(productsFolderTreeData, currentProductBrowserPath).join(' / ');
+
+    if (!searchQuery && !effectiveBrowserPath.length && visibleFolders.length === 1 && visibleFolders[0]?.children?.length) {
+        renderedBrowserPath = [Number(visibleFolders[0].id)];
+        visibleFolders = getCleanFoldersAtPath(folders, renderedBrowserPath);
+        currentPathText = getFolderPathNames(productsFolderTreeData, renderedBrowserPath).join(' / ');
+    }
 
     if (searchQuery) {
         if (normalizeProductSearchText(searchQuery).length < 2) {
@@ -8923,7 +8943,7 @@ function renderProductFoldersTree(folders) {
     rows.push(...visibleFolders.map(folder => `
         <li data-id="${folder.id}" class="${String(currentProductFolderView) === String(folder.id) ? 'active' : ''}">
             <div class="folder-row" data-folder-id="${folder.id}">
-                ${getFolderLeadingMarkup(folder.name, effectiveBrowserPath.length, currentPathText)}
+                ${getFolderLeadingMarkup(folder.name, renderedBrowserPath.length, currentPathText)}
                 <div class="folder-text">
                     <span class="folder-name" title="${escapeHtml(formatProductFolderLabel(folder.name))}">${escapeHtml(formatProductFolderLabel(folder.name))}</span>
                 </div>
@@ -8972,8 +8992,8 @@ function renderProductFoldersTree(folders) {
 
             currentProductFolderView = folder.id;
             currentProductBrowserPath = folder.children?.length
-                ? [...currentProductBrowserPath, folder.id]
-                : [...currentProductBrowserPath];
+                ? [...renderedBrowserPath, folder.id]
+                : [...renderedBrowserPath];
             productsCurrentPage = 1;
             saveProductsUiState();
             loadProducts();
@@ -9970,9 +9990,9 @@ let productsPerPage = 5;
 const PRODUCT_SERVER_SEARCH_ENABLED = false;
 const PRODUCTS_SUMMARY_ENDPOINT = '/api/products?compact=1';
 const PRODUCTS_CONNECTED_SUMMARY_ENDPOINT = '/api/products?compact=1&connected_only=1';
-const PRODUCTS_SECTION_CACHE_KEY = 'productsSectionCacheV2';
-const PRODUCTS_DOM_CACHE_KEY = 'productsDomCacheV2';
-const PARSER_DOM_CACHE_KEY = 'parserDomCacheV1';
+const PRODUCTS_SECTION_CACHE_KEY = 'productsSectionCacheV3';
+const PRODUCTS_DOM_CACHE_KEY = 'productsDomCacheV3';
+const PARSER_DOM_CACHE_KEY = 'parserDomCacheV2';
 
 function readProductsSectionCache() {
     try {

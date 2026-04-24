@@ -7624,13 +7624,14 @@ function armInitialUiRevealFallback() {
         });
     } else if (sectionId === 'userbots') {
         runSectionTask(async () => {
-            loadUserbots();
-            loadTrackedChats();
+            loadUserbots(true);
+            loadTrackedChats(true);
             loadApiSources();
         });
     } else if (sectionId === 'interaction_bots') {
         runSectionTask(async () => {
-            loadInteractionBots();
+            loadInteractionBots(true);
+            loadTrackedChats(true);
         });
     } else if (sectionId === 'products') {
         runSectionTask(async () => {
@@ -9505,7 +9506,7 @@ window.generateQR = async function(apiId, apiHash, sessionId = null) {
             if (data.already_authorized) {
                 qrStatus.innerText = '✅ Вы уже авторизованы. Запускаем слушатель...';
                 startPolling();
-                loadUserbots();
+                loadUserbots(true);
                 setTimeout(() => { document.getElementById('bot-form-container').style.display = 'none'; }, 2000);
             } else if (data.qr) {
                 qrImage.innerHTML = `<img src="data:image/png;base64,${data.qr}" alt="QR код">`;
@@ -9519,7 +9520,7 @@ window.generateQR = async function(apiId, apiHash, sessionId = null) {
                         clearInterval(checkInterval);
                         checkInterval = null;
                         startPolling();
-                        loadUserbots();
+                        loadUserbots(true);
                         setTimeout(() => { document.getElementById('bot-form-container').style.display = 'none'; }, 2000);
                     }
                 }, 2000);
@@ -11132,8 +11133,8 @@ document.addEventListener('change', (event) => {
 });
 
         // --- Логика Взаимодействия с ботами ---
-       async function loadInteractionBots() {
-            const bots = await cachedApiFetch('/api/userbots');
+       async function loadInteractionBots(forceRefresh = false) {
+            const bots = await cachedApiFetch('/api/userbots', forceRefresh);
             const select = document.getElementById('ib_userbot_id');
             if(select) {
                 select.innerHTML = bots.filter(b => b.status === 'active').map(b => `<option value="${b.id}">${b.account_name || 'API ID: ' + b.api_id}</option>`).join('');
@@ -11231,7 +11232,8 @@ document.addEventListener('change', (event) => {
             
             e.target.reset();
             document.getElementById('ib_edit_id').value = ''; // Очищаем скрытый ID
-            loadInteractionBots();
+            loadInteractionBots(true);
+            loadTrackedChats(true);
         });
 
         async function deleteInteractionBot(id) {
@@ -11243,7 +11245,8 @@ document.addEventListener('change', (event) => {
             });
             if (!confirmed) return;
             await apiFetch(`/api/interaction_bots/${id}`, { method: 'DELETE' });
-            loadInteractionBots();
+            loadInteractionBots(true);
+            loadTrackedChats(true);
         }
       
         const searchTags = document.getElementById('search-tags');
@@ -12259,8 +12262,8 @@ window.deleteSelectedMessages = async function() {
 };
        
   // 2. ФУНКЦИИ УПРАВЛЕНИЯ ЮЗЕРБОТАМИ
- async function loadUserbots() {
-    const bots = await cachedApiFetch('/api/userbots');
+ async function loadUserbots(forceRefresh = false) {
+    const bots = await cachedApiFetch('/api/userbots', forceRefresh);
     const container = document.getElementById('userbot-list');
     if (!container) return;
     
@@ -12322,7 +12325,7 @@ window.deleteSelectedMessages = async function() {
     container.querySelectorAll('.toggle-bot').forEach(btn => {
         btn.addEventListener('click', async () => {
             await apiFetch(`/api/userbots/${btn.dataset.id}/toggle`, { method: 'POST' });
-            loadUserbots();
+            loadUserbots(true);
         });
     });
 
@@ -12358,8 +12361,9 @@ window.deleteSelectedMessages = async function() {
             });
             if (!confirmed) return;
             await apiFetch(`/api/userbots/${btn.dataset.id}`, { method: 'DELETE' });
-            loadUserbots();
-            loadTrackedChats();
+            loadUserbots(true);
+            loadInteractionBots(true);
+            loadTrackedChats(true);
         });
     });
 } // <--- Конец функции loadUserbots
@@ -12379,7 +12383,7 @@ window.deleteSelectedMessages = async function() {
         
         // Маленькое уведомление, чтобы понимать, что сохранилось
         alert('✅ Расписание для юзербота успешно сохранено!');
-        loadUserbots();
+        loadUserbots(true);
     };
 
         
@@ -12398,7 +12402,8 @@ document.querySelectorAll('.delete-chat').forEach(btn => {
             });
             if (!confirmed) return;
             await apiFetch(`/api/tracked_chats/${id}`, { method: 'DELETE' });
-            loadTrackedChats();
+            loadInteractionBots(true);
+            loadTrackedChats(true);
         });
     });
 
@@ -12421,7 +12426,7 @@ document.querySelectorAll('.delete-chat').forEach(btn => {
                 document.getElementById('new-chat-id').value = '';
                 document.getElementById('new-chat-name').value = '';
                 
-                loadTrackedChats();
+                loadTrackedChats(true);
             } catch (error) {
                 console.log("Добавление отменено:", error.message);
             }
@@ -13953,8 +13958,8 @@ socket.on('db_updated', function(data) {
     }, 500); // 500 мс задержки
 });
 
-async function loadTrackedChats() {
-    const chats = await cachedApiFetch('/api/tracked_chats');
+async function loadTrackedChats(forceRefresh = false) {
+    const chats = await cachedApiFetch('/api/tracked_chats', forceRefresh);
     const list = document.getElementById('tracked-chats-list');
     if (!list) return;
 
@@ -14016,7 +14021,8 @@ async function loadTrackedChats() {
             });
             if (!confirmed) return;
             await apiFetch(`/api/tracked_chats/${id}`, { method: 'DELETE' });
-            loadTrackedChats();
+            loadInteractionBots(true);
+            loadTrackedChats(true);
         });
     });
     

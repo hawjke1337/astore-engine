@@ -218,6 +218,91 @@ def table_exists(db, table_name):
     return bool(get_table_sql(db, table_name))
 
 
+def row_has_column(row, column_name):
+    return row is not None and column_name in row.keys()
+
+
+def normalize_telegram_ref(value):
+    raw = str(value or '').strip().lower()
+    if not raw:
+        return ''
+    raw = raw.split('?', 1)[0].strip()
+    raw = raw.rstrip('/').strip()
+    match = re.search(r'(?:t\.me|telegram\.me)/([^/\s)]+)', raw)
+    if match:
+        raw = match.group(1)
+    raw = re.sub(r'^(?:https?://)?(?:www\.)?', '', raw)
+    raw = raw.lstrip('@').strip()
+    return raw
+
+
+def get_interaction_bot_tracked_chat_ids(db, user_id, bot_rows):
+    tracked_ids = set()
+    bot_rows = [row for row in bot_rows if row]
+    if not bot_rows:
+        return tracked_ids
+
+    for bot in bot_rows:
+        if row_has_column(bot, 'tracked_chat_id') and bot['tracked_chat_id']:
+            tracked_ids.add(int(bot['tracked_chat_id']))
+        if row_has_column(bot, 'resolved_chat_id') and bot['resolved_chat_id']:
+            rows = db.execute(
+                "SELECT id FROM tracked_chats WHERE user_id=? AND chat_id=?",
+                (user_id, bot['resolved_chat_id'])
+            ).fetchall()
+            tracked_ids.update(int(row['id']) for row in rows)
+
+    tracked_rows = db.execute(
+        "SELECT id, chat_id, chat_title, custom_name FROM tracked_chats WHERE user_id=?",
+        (user_id,)
+    ).fetchall()
+    for bot in bot_rows:
+        bot_refs = {
+            normalize_telegram_ref(bot['bot_username'] if 'bot_username' in bot.keys() else ''),
+            normalize_telegram_ref(bot['custom_name'] if 'custom_name' in bot.keys() else ''),
+        }
+        bot_refs.discard('')
+        if not bot_refs:
+            continue
+        for chat in tracked_rows:
+            chat_refs = {
+                normalize_telegram_ref(chat['chat_id']),
+                normalize_telegram_ref(chat['chat_title']),
+                normalize_telegram_ref(chat['custom_name']),
+            }
+            chat_refs.discard('')
+            if bot_refs.intersection(chat_refs):
+                tracked_ids.add(int(chat['id']))
+    return tracked_ids
+
+
+def delete_tracked_chats_by_ids(db, user_id, tracked_ids):
+    deleted = 0
+    for tracked_id in sorted({int(item) for item in tracked_ids if item}):
+        row = db.execute(
+            "SELECT chat_id FROM tracked_chats WHERE id=? AND user_id=?",
+            (tracked_id, user_id)
+        ).fetchone()
+        if not row:
+            continue
+        real_chat_id = row['chat_id']
+        db.execute(
+            "DELETE FROM product_messages WHERE message_id IN (SELECT id FROM messages WHERE chat_id=? AND user_id=?)",
+            (real_chat_id, user_id)
+        )
+        db.execute("DELETE FROM messages WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
+        db.execute("DELETE FROM excel_configs WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
+        db.execute("DELETE FROM excel_missing_sheets WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
+        db.execute("DELETE FROM tracked_chats WHERE id=? AND user_id=?", (tracked_id, user_id))
+        deleted += 1
+    return deleted
+
+
+def delete_all_tracked_chats_for_user(db, user_id):
+    rows = db.execute("SELECT id FROM tracked_chats WHERE user_id=?", (user_id,)).fetchall()
+    return delete_tracked_chats_by_ids(db, user_id, [row['id'] for row in rows])
+
+
 def get_next_product_sort_index(db, user_id):
     row = db.execute(
         "SELECT COALESCE(MAX(sort_index), 0) + 1 FROM products WHERE user_id = ?",
@@ -5078,19 +5163,26 @@ def manage_interaction_bots():
     if not numeric_chat_id:
         return jsonify({'error': 'Не удалось определить ID бота. Убедитесь, что юзербот включен и юзернейм указан верно (например, @MyBot).'}), 400
 
-    # 3. Сохраняем автоматизацию (здесь оставляем текст, чтобы бот знал, кому писать)
-    db.execute("""INSERT INTO interaction_bots 
-                  (user_id, userbot_id, bot_username, custom_name, commands, interval_minutes, status) 
-                  VALUES (?, ?, ?, ?, ?, ?, 'active')""",
-               (user_id, userbot_id, bot_username, custom_name,
-                json.dumps(data.get('commands', [])), data.get('interval_minutes', 60)))
-    
-    # 4. АВТОМАТИЧЕСКОЕ ДОБАВЛЕНИЕ В ПАРСЕР (здесь используем ЧИСЛОВОЙ ID!)
+    # 3. АВТОМАТИЧЕСКОЕ ДОБАВЛЕНИЕ В ПАРСЕР (здесь используем ЧИСЛОВОЙ ID!)
+    tracked_chat_id = None
     try:
         db.execute("INSERT INTO tracked_chats (user_id, chat_id, chat_title, custom_name) VALUES (?, ?, ?, ?)",
                    (user_id, numeric_chat_id, bot_username, custom_name))
     except sqlite3.IntegrityError:
         pass # Уже добавлен
+    tracked_row = db.execute(
+        "SELECT id FROM tracked_chats WHERE user_id=? AND chat_id=?",
+        (user_id, numeric_chat_id)
+    ).fetchone()
+    if tracked_row:
+        tracked_chat_id = tracked_row['id']
+
+    # 4. Сохраняем автоматизацию и прямую связь с записью в отслеживаемых чатах.
+    db.execute("""INSERT INTO interaction_bots 
+                  (user_id, userbot_id, bot_username, custom_name, commands, interval_minutes, status, tracked_chat_id, resolved_chat_id) 
+                  VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+               (user_id, userbot_id, bot_username, custom_name,
+                json.dumps(data.get('commands', [])), data.get('interval_minutes', 60), tracked_chat_id, numeric_chat_id))
 
     db.commit()
     notify_clients()
@@ -5107,20 +5199,10 @@ def delete_interaction_bot(id):
     db = get_db()
     user_id = session['user_id']
     
-    # 1. Находим бота перед удалением
-    bot = db.execute("SELECT bot_username FROM interaction_bots WHERE id=? AND user_id=?", (id, user_id)).fetchone()
+    bot = db.execute("SELECT * FROM interaction_bots WHERE id=? AND user_id=?", (id, user_id)).fetchone()
     if bot:
-        bot_un = bot['bot_username']
-        # 2. Ищем его в отслеживаемых чатах и удаляем все его настройки и сохраненные сообщения
-        tc_list = db.execute("SELECT id, chat_id FROM tracked_chats WHERE user_id=? AND (chat_title=? OR custom_name=? OR chat_title=?)", 
-                             (user_id, bot_un, bot_un, bot_un.replace('@', ''))).fetchall()
-        for tc in tc_list:
-            real_chat_id = tc['chat_id']
-            db.execute("DELETE FROM product_messages WHERE message_id IN (SELECT id FROM messages WHERE chat_id=? AND user_id=?)", (real_chat_id, user_id))
-            db.execute("DELETE FROM messages WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
-            db.execute("DELETE FROM excel_configs WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
-            db.execute("DELETE FROM excel_missing_sheets WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
-            db.execute("DELETE FROM tracked_chats WHERE id=?", (tc['id'],))
+        tracked_ids = get_interaction_bot_tracked_chat_ids(db, user_id, [bot])
+        delete_tracked_chats_by_ids(db, user_id, tracked_ids)
             
     db.execute("DELETE FROM interaction_bots WHERE id=? AND user_id=?", (id, user_id))
     db.commit()
@@ -5291,6 +5373,8 @@ def init_db():
                 interval_minutes INTEGER NOT NULL DEFAULT 60,
                 last_run TIMESTAMP,
                 status TEXT DEFAULT 'active',
+                tracked_chat_id INTEGER,
+                resolved_chat_id INTEGER,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(userbot_id) REFERENCES user_telegram_sessions(id) ON DELETE CASCADE
             );
@@ -5334,6 +5418,8 @@ def init_db():
             ("messages", "is_delayed INTEGER DEFAULT 0"),
             ("tracked_chats", "custom_name TEXT"),
             ("interaction_bots", "custom_name TEXT"),
+            ("interaction_bots", "tracked_chat_id INTEGER"),
+            ("interaction_bots", "resolved_chat_id INTEGER"),
             ("messages", "sender_name TEXT"),
             ("products", "folder_id INTEGER"),
             ("user_telegram_sessions", "account_name TEXT"),
@@ -8206,7 +8292,23 @@ def delete_userbot(bot_id):
     if session_file and os.path.exists(session_file):
         os.remove(session_file)
 
+    interaction_rows = db.execute(
+        "SELECT * FROM interaction_bots WHERE user_id=? AND userbot_id=?",
+        (user_id, bot_id)
+    ).fetchall()
+    tracked_ids = get_interaction_bot_tracked_chat_ids(db, user_id, interaction_rows)
+    delete_tracked_chats_by_ids(db, user_id, tracked_ids)
+    db.execute("DELETE FROM interaction_bots WHERE user_id=? AND userbot_id=?", (user_id, bot_id))
     db.execute("DELETE FROM user_telegram_sessions WHERE id = ?", (bot_id,))
+
+    remaining_accounts = db.execute(
+        "SELECT COUNT(*) FROM user_telegram_sessions WHERE user_id=?",
+        (user_id,)
+    ).fetchone()[0]
+    if not remaining_accounts:
+        db.execute("DELETE FROM interaction_bots WHERE user_id=?", (user_id,))
+        delete_all_tracked_chats_for_user(db, user_id)
+
     db.commit()
     notify_clients()
     return jsonify({'success': True})
@@ -8429,29 +8531,14 @@ def add_tracked_chat():
         return jsonify({'error': 'Этот чат уже добавлен в список отслеживаемых'}), 400
 
 @app.route('/api/tracked_chats/<item_id>', methods=['DELETE'])
+@login_required
 def delete_tracked_chat(item_id):
     try:
         db = get_db()
         user_id = session.get('user_id')
-        
-        # 1. Узнаем настоящий Telegram ID этого чата (например, -1001234567) по его ID в таблице (например, 43)
-        row = db.execute("SELECT chat_id FROM tracked_chats WHERE id=? AND user_id=?", (item_id, user_id)).fetchone()
-        
-        if row:
-            real_chat_id = row['chat_id']
-            
-            # 2. Удаляем привязки цен и сообщения
-            db.execute("DELETE FROM product_messages WHERE message_id IN (SELECT id FROM messages WHERE chat_id=? AND user_id=?)", (real_chat_id, user_id))
-            db.execute("DELETE FROM messages WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
-            
-            # 3. ДОБАВЛЕНО: Полностью сносим старые настройки файлов
-            db.execute("DELETE FROM excel_configs WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
-            db.execute("DELETE FROM excel_missing_sheets WHERE chat_id=? AND user_id=?", (real_chat_id, user_id))
-            
-        # 4. Удаляем сам чат
-        db.execute("DELETE FROM tracked_chats WHERE id=? AND user_id=?", (item_id, user_id))
-        
+        delete_tracked_chats_by_ids(db, user_id, [item_id])
         db.commit()
+        notify_clients()
         return jsonify({'success': True})
     except Exception as e:
         db.rollback()

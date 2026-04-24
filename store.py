@@ -8596,7 +8596,7 @@ LOGIN_TEMPLATE = """
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Вход в систему</title>
+    <title>Astore Engine</title>
     <style>
         :root {
             --accent-blue: #b8d8f5;
@@ -8648,15 +8648,13 @@ LOGIN_TEMPLATE = """
             align-items: center;
             gap: 14px;
         }
-        .login-topbar img {
-            height: 48px;
-            width: auto;
-            display: block;
-        }
-        .login-topbar-text {
-            color: #d3d5da;
-            font-size: 18px;
-            font-weight: 600;
+        .login-wordmark {
+            color: #eef3f8;
+            font-size: 22px;
+            font-weight: 800;
+            letter-spacing: 0;
+            line-height: 1;
+            white-space: nowrap;
         }
         .login-shell {
             flex: 1;
@@ -8774,14 +8772,13 @@ LOGIN_TEMPLATE = """
 <body>
     <div class="login-topbar">
         <div class="login-topbar-inner">
-            <img src="/logo.svg?v=3" alt="a:store">
-            <span class="login-topbar-text">direct</span>
+            <div class="login-wordmark" aria-label="Astore Engine">Astore Engine</div>
         </div>
     </div>
     <div class="login-shell">
         <div class="login-box">
             <h2>Вход в систему</h2>
-            <p class="login-subtitle">Авторизация в рабочем интерфейсе a:store direct</p>
+            <p class="login-subtitle">Авторизация в рабочем интерфейсе Astore Engine</p>
             {% if error %}
                 <div class="error">{{ error }}</div>
             {% endif %}
@@ -8798,7 +8795,7 @@ LOGIN_TEMPLATE = """
         </div>
     </div>
     <div class="login-footer">
-        <div class="login-footer-inner">© astore, 2022-2026. Все права защищены.</div>
+        <div class="login-footer-inner">© Astore Engine, 2022-2026. Все права защищены.</div>
     </div>
 
     <script>

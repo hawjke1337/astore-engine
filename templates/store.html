@@ -175,36 +175,26 @@
             align-items: center;
             gap: 12px;
             flex: 0 0 auto;
-            min-width: 248px;
+            min-width: 190px;
             cursor: pointer;
             user-select: none;
             -webkit-user-select: none;
             -webkit-touch-callout: none;
             transition: none;
         }
-        .top-brand img,
         .top-brand-text {
             user-select: none;
             -webkit-user-select: none;
-            -webkit-user-drag: none;
         }
         .top-brand:hover,
         .top-brand:active {
             opacity: 1;
             transform: none;
         }
-        .top-brand img {
-            display: block;
-            height: 46px;
-            width: 192px;
-            min-width: 192px;
-            flex: 0 0 192px;
-            object-fit: contain;
-        }
         .top-brand-text {
-            color: #c9cacf;
-            font-size: 17px;
-            font-weight: 600;
+            color: #eef3f8;
+            font-size: 20px;
+            font-weight: 800;
             letter-spacing: 0;
             flex: 0 0 auto;
             white-space: nowrap;
@@ -4578,11 +4568,6 @@
                 min-width: 0;
                 flex-basis: auto;
             }
-            .top-brand img {
-                width: clamp(142px, 18vw, 184px);
-                min-width: 0;
-                flex-basis: auto;
-            }
             .content-area {
                 max-width: 100%;
                 padding: 16px;
@@ -4618,12 +4603,8 @@
                 flex: 1 1 0;
                 gap: 8px;
             }
-            .top-brand img {
-                width: clamp(126px, 38vw, 170px);
-                height: auto;
-            }
             .top-brand-text {
-                font-size: 15px;
+                font-size: 18px;
             }
             .logout-btn {
                 width: 38px;
@@ -4798,11 +4779,8 @@
                 padding-left: max(10px, env(safe-area-inset-left));
                 padding-right: max(10px, env(safe-area-inset-right));
             }
-            .top-brand img {
-                width: clamp(112px, 42vw, 148px);
-            }
             .top-brand-text {
-                font-size: 13px;
+                font-size: 16px;
             }
             .content-area {
                 padding: 10px;
@@ -4867,8 +4845,7 @@
     <div class="top-menu-wrapper">
     <div class="top-menu">
         <div class="top-brand" id="top-brand-home" role="button" tabindex="0" aria-label="Открыть главную страницу">
-            <img src="/logo.svg?v=3" alt="a:store">
-            <span class="top-brand-text">direct</span>
+            <span class="top-brand-text">Astore Engine</span>
         </div>
         <div class="top-menu-nav">
         <ul class="menu-items" id="main-menu">
@@ -6179,7 +6156,7 @@
     </div>
     <footer class="app-footer">
         <div class="app-footer-inner">
-            <div class="app-footer-copy">© astore, <span id="footer-year-range">2022-2026</span>. Все права защищены.</div>
+            <div class="app-footer-copy">© Astore Engine, <span id="footer-year-range">2022-2026</span>. Все права защищены.</div>
         </div>
     </footer>
     <script>

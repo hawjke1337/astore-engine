@@ -10,7 +10,7 @@ import logging
 import hashlib
 import functools
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 from telethon.errors import AuthKeyUnregisteredError
 from flask import (
     Flask, session, request, render_template_string,
@@ -111,6 +111,85 @@ def notify_clients(data_type="general"):
     invalidate_product_search_cache()
     invalidate_access_tree_cache()
     socketio.emit('db_updated', {'type': data_type})
+
+def normalize_incoming_text(text):
+    if not text:
+        return ''
+    text = str(text).replace('\r\n', '\n').replace('\r', '\n')
+    text = text.replace('\u200b', '').replace('\ufeff', '')
+    text = text.replace('`', '')
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'__(.*?)__', r'\1', text)
+    text = re.sub(r'(?m)^\s*[▪◾◼⬛]+\s*', '', text)
+    text = re.sub(r'[ \t]+\n', '\n', text)
+    return text.strip()
+
+def normalize_interval_minutes(value, default=60):
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+def cleanup_source_before_new_snapshot(db, user_id, chat_id):
+    db.execute("""
+        UPDATE product_messages
+        SET is_actual = 0
+        WHERE message_id IN (
+            SELECT id FROM messages
+            WHERE user_id = ? AND CAST(chat_id AS TEXT) = CAST(? AS TEXT)
+        )
+    """, (user_id, chat_id))
+    db.execute("""
+        DELETE FROM product_messages
+        WHERE status != 'confirmed'
+          AND message_id IN (
+              SELECT id FROM messages
+              WHERE user_id = ? AND CAST(chat_id AS TEXT) = CAST(? AS TEXT)
+          )
+    """, (user_id, chat_id))
+    db.execute("""
+        UPDATE messages
+        SET is_blocked = 1
+        WHERE user_id = ?
+          AND CAST(chat_id AS TEXT) = CAST(? AS TEXT)
+          AND id IN (SELECT message_id FROM product_messages WHERE status = 'confirmed')
+    """, (user_id, chat_id))
+    db.execute("""
+        DELETE FROM messages
+        WHERE user_id = ?
+          AND CAST(chat_id AS TEXT) = CAST(? AS TEXT)
+          AND id NOT IN (SELECT message_id FROM product_messages)
+    """, (user_id, chat_id))
+
+def should_accept_interaction_bot_message(db, user_id, chat_id, bot_username, message_date):
+    variants = []
+    if bot_username:
+        clean = str(bot_username).lower().replace('@', '').strip()
+        variants = [clean, f"@{clean}", f"https://t.me/{clean}", f"t.me/{clean}"]
+    row = db.execute("""
+        SELECT id, last_run
+        FROM interaction_bots
+        WHERE user_id = ?
+          AND status = 'active'
+          AND (
+              CAST(resolved_chat_id AS TEXT) = CAST(? AS TEXT)
+              OR LOWER(bot_username) IN (?, ?, ?, ?)
+          )
+        ORDER BY last_run DESC
+        LIMIT 1
+    """, (user_id, chat_id, *(variants or ['', '', '', '']))).fetchone()
+    if not row:
+        return None
+    if not row['last_run']:
+        return None
+    try:
+        last_run = datetime.strptime(row['last_run'].split('.')[0], '%Y-%m-%d %H:%M:%S')
+        msg_date = (message_date.replace(tzinfo=None) + timedelta(hours=3)) if hasattr(message_date, 'replace') else datetime.now()
+        if msg_date + timedelta(seconds=5) < last_run:
+            return None
+    except Exception:
+        return None
+    return row
 # ---------- Глобальные структуры ----------
 background_tasks = {}      # session_id -> thread
 user_clients = {}          # session_id -> (thread, client, user_id)
@@ -2855,7 +2934,7 @@ def get_product_messages(prod_id):
     # 2. Обработка ПОДТВЕРЖДЕННЫХ
     confirmed_rows = db.execute("""
         SELECT pm.id as pm_id, pm.group_id, pm.message_id, m.chat_title, m.chat_id, m.sender_name, 
-               pm.extracted_price, m.text, m.date, pm.line_index, tc.custom_name, m.type
+               pm.extracted_price, pm.is_actual, m.text, m.date, pm.line_index, tc.custom_name, m.type
         FROM product_messages pm
         JOIN messages m ON pm.message_id = m.id
         LEFT JOIN tracked_chats tc ON m.chat_id = tc.chat_id AND m.user_id = tc.user_id
@@ -2882,7 +2961,7 @@ def get_product_messages(prod_id):
                     d['date'] = latest['date'] 
                     current_id = d.get('pm_id')
                     try:
-                        db.execute("UPDATE product_messages SET message_id=?, line_index=?, extracted_price=? WHERE id=?",
+                        db.execute("UPDATE product_messages SET message_id=?, line_index=?, extracted_price=?, is_actual=1 WHERE id=?",
                                    (latest['message_id'], latest['line_index'], latest['price'], current_id))
                         has_updates = True
                     except: pass
@@ -5127,6 +5206,7 @@ def manage_interaction_bots():
     bot_username = data.get('bot_username').strip()
     custom_name = data.get('custom_name')
     userbot_id = data.get('userbot_id')
+    interval_minutes = normalize_interval_minutes(data.get('interval_minutes'), 60)
     
     # 1. Находим запущенного юзербота (он нужен, чтобы узнать числовой ID бота)
     client_to_use = None
@@ -5182,7 +5262,7 @@ def manage_interaction_bots():
                   (user_id, userbot_id, bot_username, custom_name, commands, interval_minutes, status, tracked_chat_id, resolved_chat_id) 
                   VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
                (user_id, userbot_id, bot_username, custom_name,
-                json.dumps(data.get('commands', [])), data.get('interval_minutes', 60), tracked_chat_id, numeric_chat_id))
+                json.dumps(data.get('commands', [])), interval_minutes, tracked_chat_id, numeric_chat_id))
 
     db.commit()
     notify_clients()
@@ -6104,7 +6184,7 @@ def publish_scheduler():
                               AND pm.status = 'confirmed' 
                               AND pm.is_actual = 1 
                               AND m.chat_id IN ({placeholders})
-                            ORDER BY m.date DESC LIMIT 1
+                            ORDER BY pm.extracted_price ASC, m.date DESC LIMIT 1
                         """, query_params).fetchone()
                         
                         if price_row and price_row['extracted_price'] is not None:
@@ -6258,9 +6338,9 @@ def get_catalog_for_client(client_id):
     products_raw = db.execute("""
         SELECT p.id, p.name, p.folder_id, p.price as manual_price, p.photo_url, p.brand, p.country, p.weight, p.model_number, p.is_on_request,
                p.color, p.storage, p.ram, p.warranty, p.description, p.description_html, p.specs,
-               (SELECT pm.extracted_price FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as parsed_price,
-               (SELECT pm.is_actual FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as is_actual,
-               (SELECT m.chat_id FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as latest_chat_id
+               (SELECT pm.extracted_price FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' AND pm.is_actual = 1 AND pm.extracted_price IS NOT NULL ORDER BY pm.extracted_price ASC, m.date DESC LIMIT 1) as parsed_price,
+               (SELECT pm.is_actual FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' AND pm.is_actual = 1 AND pm.extracted_price IS NOT NULL ORDER BY pm.extracted_price ASC, m.date DESC LIMIT 1) as is_actual,
+               (SELECT m.chat_id FROM product_messages pm JOIN messages m ON pm.message_id = m.id WHERE pm.product_id = p.id AND pm.status = 'confirmed' AND pm.is_actual = 1 AND pm.extracted_price IS NOT NULL ORDER BY pm.extracted_price ASC, m.date DESC LIMIT 1) as latest_chat_id
         FROM products p
         WHERE p.user_id = ?
     """, (user_id,)).fetchall()
@@ -6416,6 +6496,10 @@ def google_sheets_scheduler():
                             sheet_target = c_dict['sheet_name']
                             user_id = c_dict['user_id']
                             chat_id = c_dict['chat_id']
+
+                            if not is_user_parsing_allowed(user_id):
+                                logger.info(f"Google Sheet {url}: пропущено вне расписания пользователя {user_id}")
+                                continue
                             
                             # Пропускаем, если конкретный лист скрыт
                             if sheet_target != '*' and sheet_target not in visible_sheets:
@@ -6497,7 +6581,7 @@ def google_sheets_scheduler():
                                                     parsed_lines.append(f"{n_val} - {p_val}")
 
                             if parsed_lines:
-                                msg_text = "📊 [GOOGLE ТАБЛИЦА]:\n" + "\n".join(parsed_lines)
+                                msg_text = normalize_incoming_text("📊 [GOOGLE ТАБЛИЦА]:\n" + "\n".join(parsed_lines))
                                 tc = db.execute("SELECT custom_name, chat_title FROM tracked_chats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)).fetchone()
                                 chat_title = tc['custom_name'] if tc and tc['custom_name'] else (tc['chat_title'] if tc else str(chat_id))
                                 
@@ -6505,6 +6589,7 @@ def google_sheets_scheduler():
                                 now_str = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
                                 msg_type = f"excel_{c_dict['id']}" 
                                 
+                                cleanup_source_before_new_snapshot(db, user_id, chat_id)
                                 # Сохраняем сообщение в базу
                                 cursor = db.execute(
                                     "INSERT INTO messages (user_id, type, text, date, chat_id, chat_title, sender_name) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -6679,6 +6764,9 @@ def change_password():
 
 async def fetch_chat_history(client, target_entity, chat_title, user_id, db_chat_id=None):
     """Парсинг старых сообщений с подробной статистикой"""
+    if getattr(target_entity, 'bot', False):
+        logger.info(f"История бота {chat_title} не импортируется: принимаем только свежие ответы на команды.")
+        return
     if db_chat_id is None:
         db_chat_id = getattr(target_entity, 'id', target_entity)
 
@@ -6900,6 +6988,8 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
             # --- НОВЫЙ БЛОК: СЛУШАЕМ УДАЛЕНИЯ ---
             @client.on(MessageDeleted)
             async def deleted_handler(event):
+                if not is_parsing_allowed(session_id):
+                    return
                 with app.app_context():
                     db = get_db()
                     try:
@@ -6911,10 +7001,12 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                                 WHERE message_id IN (SELECT id FROM messages WHERE telegram_message_id = ?)
                             """, (msg_id,))
                             
-                            # 2. ФИЗИЧЕСКИ удаляем сообщение из базы
+                            # 2. Сообщение оставляем для истории карточки, но скрываем из парсера.
                             db.execute("""
-                                DELETE FROM messages WHERE telegram_message_id = ?
-                            """, (msg_id,))
+                                UPDATE messages
+                                SET is_blocked = 1
+                                WHERE telegram_message_id = ? AND user_id = ?
+                            """, (msg_id, user_id))
                             
                         db.commit()
                     except sqlite3.OperationalError as e:
@@ -6924,6 +7016,8 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
 
             @client.on(events.MessageEdited)
             async def edit_handler(event):
+                if not is_parsing_allowed(session_id):
+                    return
                 message = event.message
                 if (not message.text and not message.document):
                     return
@@ -7061,8 +7155,8 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                     return
                 # ---------------------------------------------
 
-                allowed_now = is_parsing_allowed(session_id)
-                is_delayed = 0 if allowed_now else 1
+                if not is_parsing_allowed(session_id):
+                    return
                 
                 chat_id = chat.id
 
@@ -7101,7 +7195,8 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                 sender_name = getattr(sender, 'username', '')
                 if not sender_name:
                     sender_name = getattr(sender, 'first_name', 'Бот')
-                    
+                accepted_interaction_bot = False
+
                 if is_bot:
                     bot_un = getattr(sender, 'username', '')
                     if not bot_un:
@@ -7121,14 +7216,16 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                     
                     with app.app_context():
                         local_db = get_db()
-                        # Ищем любое из 4-х совпадений: ник, @ник, t.me/ник или https://t.me/ник
-                        check_bot = local_db.execute(
-                            "SELECT id FROM interaction_bots WHERE user_id = ? AND (LOWER(bot_username) IN (?, ?, ?, ?))",
-                            (user_id, bot_un_clean, bot_un_at, bot_link_1, bot_link_2)
-                        ).fetchone()
+                        check_bot = should_accept_interaction_bot_message(
+                            local_db,
+                            user_id,
+                            chat_id,
+                            bot_un_clean,
+                            message.date,
+                        )
                         
                         if not check_bot:
-                            print(f"[БОТ ДЕБАГ] ❌ ОТКАЗ: Бот '{bot_un_clean}' не привязан к аккаунту {user_id}! Игнорируем.")
+                            print(f"[БОТ ДЕБАГ] ❌ ОТКАЗ: Бот '{bot_un_clean}' не является свежим ответом на наш запрос. Игнорируем.")
                             return
                         else:
                             print(f"[БОТ ДЕБАГ] ✅ БОТ ОДОБРЕН: '{bot_un_clean}' найден в базе. Идем дальше...")
@@ -7143,6 +7240,7 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                                 return
                             else:
                                 print(f"[БОТ ДЕБАГ] ✅ ПОЛНЫЙ УСПЕХ: Начинаем парсить!")
+                                accepted_interaction_bot = True
                 # -------------------------------------------------------------
 
                 parsed_text = await parse_excel_message(client, message, chat_id, user_id)
@@ -7154,18 +7252,16 @@ def start_message_listener(session_id, user_id, api_id, api_hash):
                 with app.app_context():
                     db = get_db()
                     try:
+                        if accepted_interaction_bot:
+                            cleanup_source_before_new_snapshot(db, user_id, chat_id)
                         # 1. Записываем новое сообщение
                         from datetime import timedelta
                         msg_date = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
                         cursor = db.execute(
-                            'INSERT INTO messages (user_id, telegram_message_id, type, text, date, chat_id, chat_title, sender_name, is_delayed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                            (user_id, message.id, msg_type, parsed_text, msg_date, chat_id, chat_title, sender_name, is_delayed)
+                            'INSERT INTO messages (user_id, telegram_message_id, type, text, date, chat_id, chat_title, sender_name, is_delayed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)',
+                            (user_id, message.id, msg_type, parsed_text, msg_date, chat_id, chat_title, sender_name)
                         )
                         db.commit()
-
-                        # ТАМОЖНЯ: Если время нерабочее - выходим (не обновляем интерфейс мгновенно)
-                        if not allowed_now:
-                            return
 
                         # Оповещаем веб-интерфейс о новом сообщении
                         notify_clients()
@@ -7619,6 +7715,10 @@ def api_parser_scheduler():
                     src_id = src['id']
                     user_id = src['user_id']
                     interval = src['interval_min']
+
+                    if not is_user_parsing_allowed(user_id):
+                        last_sync_times[src_id] = now
+                        continue
                     
                     # Проверяем, пришло ли время опрашивать этот API
                     last_run = last_sync_times.get(src_id)
@@ -7646,9 +7746,10 @@ def api_parser_scheduler():
                             for p in valid_products:
                                 lines.append(f"{p['name']} — {p['price']}")
                                 
-                            msg_text = "\n".join(lines)
+                            msg_text = normalize_incoming_text("\n".join(lines))
                             sender_name = f"🌐 API: {src['name']}"
                             
+                            cleanup_source_before_new_snapshot(db, user_id, dummy_chat_id)
                             # Вставляем "сообщение" от этого поставщика с полным списком
                             cursor = db.execute(
                                 "INSERT INTO messages (user_id, chat_id, chat_title, text, date, sender_name) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
@@ -7725,11 +7826,13 @@ def get_messages():
         page = 1
         
     try:
-        limit = int(request.args.get('limit', 20))
-        if limit < 20: limit = 20
-        elif limit > 100: limit = 100
+        limit = int(request.args.get('limit', 10))
+        if limit < 5:
+            limit = 5
+        elif limit > 100:
+            limit = 100
     except ValueError:
-        limit = 20
+        limit = 10
         
     offset = (page - 1) * limit
 
@@ -8932,7 +9035,7 @@ def update_interaction_bot(id):
     custom_name = data.get('custom_name')
     userbot_id = data.get('userbot_id')
     commands = json.dumps(data.get('commands', []))
-    interval_minutes = data.get('interval_minutes', 60)
+    interval_minutes = normalize_interval_minutes(data.get('interval_minutes'), 60)
     
     # Обновляем настройки бота
     db.execute("""
@@ -9147,11 +9250,11 @@ def public_api_catalog():
         SELECT p.id, p.name, p.folder_id, p.price as manual_price, p.photo_url, p.brand, p.country, p.weight, p.model_number, p.is_on_request,
                p.color, p.storage, p.ram, p.warranty, p.description, p.description_html, p.specs,
                (SELECT pm.extracted_price FROM product_messages pm JOIN messages m ON pm.message_id = m.id 
-                WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as parsed_price,
+                WHERE pm.product_id = p.id AND pm.status = 'confirmed' AND pm.is_actual = 1 AND pm.extracted_price IS NOT NULL ORDER BY pm.extracted_price ASC, m.date DESC LIMIT 1) as parsed_price,
                (SELECT pm.is_actual FROM product_messages pm JOIN messages m ON pm.message_id = m.id 
-                WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as is_actual,
+                WHERE pm.product_id = p.id AND pm.status = 'confirmed' AND pm.is_actual = 1 AND pm.extracted_price IS NOT NULL ORDER BY pm.extracted_price ASC, m.date DESC LIMIT 1) as is_actual,
                (SELECT m.chat_id FROM product_messages pm JOIN messages m ON pm.message_id = m.id 
-                WHERE pm.product_id = p.id AND pm.status = 'confirmed' ORDER BY m.date DESC LIMIT 1) as latest_chat_id
+                WHERE pm.product_id = p.id AND pm.status = 'confirmed' AND pm.is_actual = 1 AND pm.extracted_price IS NOT NULL ORDER BY pm.extracted_price ASC, m.date DESC LIMIT 1) as latest_chat_id
         FROM products p
         WHERE p.user_id = ?
     """, (user_id,)).fetchall()
@@ -9274,7 +9377,7 @@ def public_api_catalog():
 
 # ================= ПАРСИНГ EXCEL ТАБЛИЦ =================
 async def parse_excel_message(client, message, chat_id, user_id):
-    text_to_save = message.text or ""
+    text_to_save = normalize_incoming_text(message.text or "")
     if not message.document:
         return text_to_save
         
@@ -9433,7 +9536,7 @@ async def parse_excel_message(client, message, chat_id, user_id):
             # --- ФОРМИРОВАНИЕ ИТОГОВОГО ТЕКСТА ---
             if parsed_lines:
                 doc_type = "PDF" if ext == '.pdf' else "EXCEL"
-                text_to_save = f"📊 [{doc_type} ДАННЫЕ]:\n" + "\n".join(parsed_lines)
+                text_to_save = normalize_incoming_text(f"📊 [{doc_type} ДАННЫЕ]:\n" + "\n".join(parsed_lines))
                 
                 if unknown_sheets and ext != '.pdf':
                     with app.app_context():
@@ -9461,7 +9564,7 @@ async def parse_excel_message(client, message, chat_id, user_id):
             if 'tmp_path' in locals() and os.path.exists(tmp_path):
                 os.remove(tmp_path)
                 
-    return text_to_save
+    return normalize_incoming_text(text_to_save)
 
 
 @app.route('/api/excel/preview_latest/<chat_id>', methods=['GET'])
@@ -9705,8 +9808,33 @@ def is_parsing_allowed(session_id):
         logger.error(f"Ошибка проверки тайминга для сессии {session_id}: {e}")
         return True
 
+def is_user_parsing_allowed(user_id):
+    """
+    Общий стоп-кран для файлов/API: если у пользователя есть активные Telegram-аккаунты
+    с расписанием, новые данные принимаются только в разрешенное время хотя бы одного из них.
+    """
+    try:
+        with app.app_context():
+            db = get_db()
+            rows = db.execute("""
+                SELECT id, schedule_enabled
+                FROM user_telegram_sessions
+                WHERE user_id = ? AND status = 'active'
+            """, (user_id,)).fetchall()
+            scheduled_rows = [row for row in rows if row['schedule_enabled']]
+            if not scheduled_rows:
+                return True
+            return any(is_parsing_allowed(row['id']) for row in scheduled_rows)
+    except Exception as e:
+        logger.error(f"Ошибка проверки общего тайминга для пользователя {user_id}: {e}")
+        return True
+
 def delayed_messages_scheduler():
     while True:
+        # Старое поведение оживляло накопленные вне расписания сообщения позже.
+        # Теперь вне расписания новые данные вообще не сохраняются, чтобы не сбивать актуальные карточки.
+        time.sleep(60)
+        continue
         try:
             with app.app_context():
                 db = get_db()

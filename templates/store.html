@@ -3092,6 +3092,12 @@
             margin: 0;
             background: transparent;
         }
+        #folder-catalog-section .fc-reports-pagination {
+            margin-top: 16px;
+        }
+        #folder-catalog-section .fc-reports-pagination .pager-shell {
+            margin-bottom: 0;
+        }
         .fc-reports-table {
             width: 100%;
             table-layout: fixed;
@@ -6736,7 +6742,7 @@
                         <div class="fc-toolbar-row">
                             <div class="fc-toolbar-group">
                                 <label class="fc-toolbar-label" for="fc-report-sort">Сортировка цен</label>
-                                <select id="fc-report-sort" class="fc-toolbar-select" onchange="renderFCReports()">
+                                <select id="fc-report-sort" class="fc-toolbar-select" onchange="changeFCReportsSort()">
                                 <option value="date_desc">Сначала новые</option>
                                 <option value="price_asc">Сначала дешевле (Лучшая цена)</option>
                                 <option value="price_desc">Сначала дороже</option>
@@ -6758,6 +6764,7 @@
                             <tbody id="fc-reports-tbody"></tbody>
                         </table>
                     </div>
+                    <div id="fc-reports-pagination" class="fc-reports-pagination"></div>
                 </div>
             </div>
             <div id="userbots-section" style="display: none;">
@@ -11206,8 +11213,11 @@ qrBtn.addEventListener('click', async () => {
             initAnimatedFolderCatalogSearch();
         }
 
-        function scheduleFolderCatalogSearchUpdate({ immediate = false } = {}) {
+        function scheduleFolderCatalogSearchUpdate({ immediate = false, resetPage = true } = {}) {
             clearFolderCatalogSearchDebounce();
+            if (resetPage) {
+                fcReportsCurrentPage = 1;
+            }
 
 	            const runSearch = () => {
 	                folderCatalogSearchDebounceTimer = null;
@@ -15551,6 +15561,66 @@ document.querySelectorAll('.delete-chat').forEach(btn => {
 	        let fcReportsLoading = false;
 	        let fcReportsErrorMessage = '';
 	        let fcReportsRequestToken = 0;
+	        const FC_REPORTS_PAGE_SIZE_OPTIONS = [5, 10, 20, 50, 100];
+	        let fcReportsCurrentPage = 1;
+	        let fcReportsPerPage = normalizeFCReportsPerPage(localStorage.getItem('fcReportsPerPage') || 5);
+
+	        function normalizeFCReportsPerPage(value) {
+	            const numericValue = Number(value) || 5;
+	            return FC_REPORTS_PAGE_SIZE_OPTIONS.includes(numericValue) ? numericValue : 5;
+	        }
+
+	        function saveFCReportsPagerState() {
+	            localStorage.setItem('fcReportsPerPage', String(fcReportsPerPage || 5));
+	        }
+
+	        function renderFCReportsPagination(total) {
+	            const container = document.getElementById('fc-reports-pagination');
+	            if (!container) return;
+	            const totalItems = Math.max(0, Number(total || 0));
+	            if (!totalItems) {
+	                container.innerHTML = '';
+	                return;
+	            }
+	            const totalPages = Math.max(1, Math.ceil(totalItems / fcReportsPerPage));
+	            if (fcReportsCurrentPage > totalPages) fcReportsCurrentPage = totalPages;
+	            if (fcReportsCurrentPage < 1) fcReportsCurrentPage = 1;
+	            container.innerHTML = `
+	                <div class="pager-shell">
+	                    <div class="pager-left">
+	                        <span class="pager-label">Показывать по:</span>
+	                        <select class="pager-select" onchange="changeFCReportsLimit(this.value)">
+	                            ${FC_REPORTS_PAGE_SIZE_OPTIONS.map((size) => `<option value="${size}" ${fcReportsPerPage === size ? 'selected' : ''}>${size}</option>`).join('')}
+	                        </select>
+	                    </div>
+	                    <div class="pager-center">
+	                        <button type="button" class="pager-btn" ${fcReportsCurrentPage <= 1 ? 'disabled' : ''} onmousedown="suppressPagerFocus(event)" ontouchstart="suppressPagerFocus(event)" onclick="changeFCReportsPage(${fcReportsCurrentPage - 1})">Назад</button>
+	                        <span class="pager-status">Стр. <b>${fcReportsCurrentPage}</b> из <b>${totalPages}</b></span>
+	                        <button type="button" class="pager-btn" ${fcReportsCurrentPage >= totalPages ? 'disabled' : ''} onmousedown="suppressPagerFocus(event)" ontouchstart="suppressPagerFocus(event)" onclick="changeFCReportsPage(${fcReportsCurrentPage + 1})">Вперед</button>
+	                    </div>
+	                    <div class="pager-right">
+	                        <span class="pager-total">(Всего: ${totalItems})</span>
+	                    </div>
+	                </div>
+	            `;
+	        }
+
+	        window.changeFCReportsPage = function(page) {
+	            fcReportsCurrentPage = Math.max(1, Number(page) || 1);
+	            renderFCReports();
+	        };
+
+	        window.changeFCReportsLimit = function(limit) {
+	            fcReportsPerPage = normalizeFCReportsPerPage(limit);
+	            fcReportsCurrentPage = 1;
+	            saveFCReportsPagerState();
+	            renderFCReports();
+	        };
+
+	        window.changeFCReportsSort = function() {
+	            fcReportsCurrentPage = 1;
+	            renderFCReports();
+	        };
 	
 	        function canShowFolderCatalogReports(viewId = currentView, query = getFolderCatalogSearchQuery()) {
 	            if (viewId === 'catalog' || viewId === 'all' || viewId === null || typeof viewId === 'undefined') {
@@ -15713,6 +15783,7 @@ document.querySelectorAll('.delete-chat').forEach(btn => {
             fcCurrentProducts = getParserCatalogProducts(normalizedFolderId);
             if (!preserveExpanded || previousView !== nextView) {
                 fcExpandedProductId = null;
+                fcReportsCurrentPage = 1;
             } else if (fcExpandedProductId) {
                 const hasExpandedProduct = fcCurrentProducts.some((product) => Number(product?.id) === Number(fcExpandedProductId));
                 if (!hasExpandedProduct) {
@@ -15733,6 +15804,7 @@ document.querySelectorAll('.delete-chat').forEach(btn => {
 	            const initialSourceProducts = getFolderCatalogSearchScopeProducts();
 	            if (!fcCanShowReports || !initialSourceProducts.length) {
 	                if (reportsBlock) reportsBlock.style.display = 'none';
+	                renderFCReportsPagination(0);
 	                return;
 	            }
 
@@ -15991,16 +16063,19 @@ window.toggleFCReportDetails = function(productId) {
 	    if (!tbody) return;
 	    if (!fcCanShowReports || !sourceProducts.length) {
 	        tbody.innerHTML = '';
+	        renderFCReportsPagination(0);
 	        return;
 	    }
 
-    if (fcReportsLoading) {
+    if (fcReportsLoading && !(Array.isArray(fcReportsData) && fcReportsData.length)) {
         tbody.innerHTML = '<tr><td colspan="3" class="no-messages fc-report-empty-cell">Загрузка цен...</td></tr>';
+        renderFCReportsPagination(0);
         return;
     }
 
     if (fcReportsErrorMessage) {
         tbody.innerHTML = `<tr><td colspan="3" class="no-messages fc-report-empty-cell">${escapeHtml(fcReportsErrorMessage)}</td></tr>`;
+        renderFCReportsPagination(0);
         return;
     }
 
@@ -16062,7 +16137,15 @@ window.toggleFCReportDetails = function(productId) {
         return new Date(b.latest_date) - new Date(a.latest_date);
     });
 
-    tbody.innerHTML = groupedData.map(group => {
+    const totalReports = groupedData.length;
+    const totalPages = Math.max(1, Math.ceil(totalReports / fcReportsPerPage));
+    if (fcReportsCurrentPage > totalPages) fcReportsCurrentPage = totalPages;
+    if (fcReportsCurrentPage < 1) fcReportsCurrentPage = 1;
+    const pageStart = (fcReportsCurrentPage - 1) * fcReportsPerPage;
+    const pageGroups = groupedData.slice(pageStart, pageStart + fcReportsPerPage);
+    renderFCReportsPagination(totalReports);
+
+    tbody.innerHTML = pageGroups.map(group => {
         const item = group.bestRow || {};
         const isActual = Number(group.is_actual) === 1;
         const statusBadge = isActual
@@ -16110,6 +16193,9 @@ window.toggleFCReportDetails = function(productId) {
         ` : ''}
         `;
     }).join('') || `<tr><td colspan="3" class="no-messages fc-report-empty-cell">${hasSearchQuery ? 'Ничего не найдено по этому запросу' : 'Пока нет подтвержденных цен для этого товара'}</td></tr>`;
+    if (!pageGroups.length) {
+        renderFCReportsPagination(0);
+    }
 }
 
         // Массивы для хранения активных фильтров

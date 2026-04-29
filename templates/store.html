@@ -18,7 +18,8 @@
         ]);
         const savedSection = localStorage.getItem('activeSection') || 'products';
         root.dataset.initialSection = allowedSections.has(savedSection) ? savedSection : 'products';
-        root.dataset.initialFolder = localStorage.getItem('activeFolder') || 'inbox';
+        const savedFolder = localStorage.getItem('activeFolder');
+        root.dataset.initialFolder = savedFolder || (savedSection === 'parser' ? 'catalog' : 'inbox');
     } catch (error) {
         root.dataset.initialSection = 'products';
         root.dataset.initialFolder = 'inbox';
@@ -7466,6 +7467,20 @@ function syncParserCatalogTriggerState() {
     trigger.setAttribute('aria-pressed', currentView === 'catalog' ? 'true' : 'false');
 }
 
+function setParserCatalogRootState() {
+    currentView = 'catalog';
+    parserCatalogActiveView = 'catalog';
+    parserFolderBrowserPath = [];
+    localStorage.setItem('activeFolder', 'catalog');
+    const titleEl = document.getElementById('fc-title');
+    const subtitleEl = document.getElementById('fc-subtitle');
+    const toolbarEl = document.getElementById('fc-toolbar');
+    if (titleEl) titleEl.innerText = 'Каталог';
+    if (subtitleEl) subtitleEl.innerText = '';
+    if (toolbarEl) toolbarEl.style.display = 'none';
+    syncParserCatalogTriggerState();
+}
+
 function openParserDataView() {
     currentView = 'inbox';
     parserCatalogActiveView = 'catalog';
@@ -7479,13 +7494,9 @@ function openParserDataView() {
 }
 
 function openParserCatalogView() {
-    currentView = 'catalog';
-    parserCatalogActiveView = 'catalog';
-    parserFolderBrowserPath = [];
-    localStorage.setItem('activeFolder', currentView);
+    setParserCatalogRootState();
     document.getElementById('parser-section').style.display = 'none';
     document.getElementById('folder-catalog-section').style.display = 'block';
-    syncParserCatalogTriggerState();
     renderFolderTree(parserFolderTreeData);
     loadFolderCatalog('catalog');
 }
@@ -8897,6 +8908,10 @@ function armInitialUiRevealFallback() {
             hydrateParserSectionFromCache();
             await loadFolders(false, { skipRenderIfUnchanged: restoredFromSnapshot });
             if (activeMainSection !== sectionId || latestSectionSwitchToken !== sectionSwitchToken) return;
+            if (currentView !== 'inbox' && typeof loadFolderCatalog === 'function') {
+                await loadFolderCatalog(getParserCatalogActiveView(), { preserveExpanded: true });
+                if (activeMainSection !== sectionId || latestSectionSwitchToken !== sectionSwitchToken) return;
+            }
             startPolling();
         });
     } else if (sectionId === 'userbots') {
@@ -9150,21 +9165,24 @@ function buildParserFolderCounts(folders, products) {
 function buildParserFolderProductBuckets(folders, products) {
     const buckets = new Map();
     const confirmedProducts = getConfirmedParserProducts(products);
-    buckets.set('catalog', confirmedProducts);
+    const visibleFolderIds = new Set();
 
     function seed(items) {
         (items || []).forEach((folder) => {
             if (folder.name === 'По умолчанию') return;
-            buckets.set(Number(folder.id), []);
+            const folderId = Number(folder.id);
+            visibleFolderIds.add(folderId);
+            buckets.set(folderId, []);
             if (folder.children?.length) seed(folder.children);
         });
     }
 
     seed(folders);
+    buckets.set('catalog', confirmedProducts.filter((product) => visibleFolderIds.has(getProductAssignedFolderId(product))));
 
     confirmedProducts.forEach((product) => {
         const folderId = getProductAssignedFolderId(product);
-        if (!folderId) return;
+        if (!folderId || !visibleFolderIds.has(folderId)) return;
         const lineage = getFolderLineageIds(folders, folderId);
         lineage.forEach((id) => {
             const key = Number(id);
@@ -9178,7 +9196,7 @@ function buildParserFolderProductBuckets(folders, products) {
 
 function getParserCatalogProducts(viewId = currentView) {
     if (viewId === 'catalog' || viewId === 'all' || viewId === null || typeof viewId === 'undefined') {
-        return Array.isArray(parserConnectedProducts) ? parserConnectedProducts : [];
+        return parserFolderProductBuckets.get('catalog') || [];
     }
     const numericId = Number(viewId);
     if (!Number.isFinite(numericId)) return [];
@@ -10017,10 +10035,10 @@ function updateProductsContentState({ activeFolder = null, canShowProducts = fal
 function prepareProductsBaseDataset(products, folders = productsFolderTreeData) {
     return (Array.isArray(products) ? products : []).map((product) => {
         const effectiveFolderId = resolveProductFolderId(product, folders);
-        return {
+        return decorateProductSearchEntry({
             ...product,
             effective_folder_id: effectiveFolderId
-        };
+        }, folders);
     });
 }
 
@@ -10034,6 +10052,7 @@ function decorateProductSearchEntry(product, folders = productsFolderTreeData) {
     const searchBrand = normalizeProductSearchText(baseProduct?.brand);
     const searchModel = normalizeProductSearchText(baseProduct?.model_number);
     const searchSynonyms = normalizeProductSearchText(baseProduct?.synonyms);
+    const derivedAliases = buildDerivedProductSearchAliases(baseProduct);
     const searchBlob = ` ${[
         searchName,
         searchBrand,
@@ -10042,6 +10061,7 @@ function decorateProductSearchEntry(product, folders = productsFolderTreeData) {
         normalizeProductSearchText(baseProduct?.storage),
         normalizeProductSearchText(baseProduct?.color),
         normalizeProductSearchText(baseProduct?.country),
+        ...derivedAliases.map((alias) => normalizeProductSearchText(alias)),
     ].filter(Boolean).join(' ')} `;
     const accessorySource = normalizeProductSearchText([
         baseProduct?.name,
@@ -10547,7 +10567,15 @@ function activateHomeSection() {
             item.addEventListener('click', () => {
                 const section = item.dataset.section;
                 if (section) {
-                    if (activeMainSection === section) return;
+                    if (section === 'parser') {
+                        setParserCatalogRootState();
+                        if (activeMainSection === section) {
+                            openParserCatalogView();
+                            return;
+                        }
+                    } else if (activeMainSection === section) {
+                        return;
+                    }
                     showSection(section);
                 }
             });
@@ -11318,7 +11346,7 @@ let productsCurrentPage = 1;
 let productsPerPage = 5;
 const PRODUCT_SERVER_SEARCH_ENABLED = false;
 const PRODUCTS_SUMMARY_ENDPOINT = '/api/products?compact=1';
-const PRODUCTS_CONNECTED_SUMMARY_ENDPOINT = '/api/products?compact=1&connected_only=1';
+const PRODUCTS_CONNECTED_SUMMARY_ENDPOINT = '/api/products?compact=1&connected_only=1&summary=parser';
 const PRODUCTS_SECTION_CACHE_KEY = 'productsSectionCacheV5';
 const PRODUCTS_DOM_CACHE_KEY = 'productsDomCacheV5';
 const PARSER_DOM_CACHE_KEY = 'parserDomCacheV4';
@@ -12583,7 +12611,7 @@ async function openEditProductById(productId) {
 	            renderProductBindingData(prodId, fastData, { proposedLoading: true });
 
                 try {
-                    const fullData = await apiFetch(`/api/products/${prodId}/messages?skip_maintenance=1&recent_limit=350`, {
+                    const fullData = await apiFetch(`/api/products/${prodId}/messages?recent_limit=350`, {
                         signal: controller.signal,
                         suppressAlert: true,
                         retryCount: 1
@@ -16446,6 +16474,8 @@ function restoreUIState() {
         // Если это число (ID папки), преобразуем обратно в число
         currentView = isNaN(savedFolder) || savedFolder === 'inbox' ? savedFolder : parseInt(savedFolder);
         // Интерфейс дерева папок подтянется сам после вызова loadFolders()
+    } else if ((localStorage.getItem('activeSection') || 'products') === 'parser') {
+        setParserCatalogRootState();
     }
 
     restoreProductsUiState();

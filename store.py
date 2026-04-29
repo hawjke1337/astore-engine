@@ -4856,16 +4856,11 @@ def get_product_messages(prod_id):
     product_country = prod['country'] or ""
     product_synonyms = prod['synonyms'] or ""
 
-    if AUTO_BINDING_MAINTENANCE_ENABLED and not skip_maintenance:
+    if not skip_maintenance:
         should_notify_products = False
         with sqlite_write_lock:
-            removed_duplicates = prune_duplicate_confirmed_bindings(db, product_id=prod_id)
-            deactivated_bindings = deactivate_confirmed_bindings_from_inactive_messages(db, product_id=prod_id)
-            removed_discount_bindings = remove_discount_section_confirmed_bindings(db, product_id=prod_id)
-            sanitized_bindings = sanitize_confirmed_binding_records(db, product_id=prod_id, user_id=user_id)
-            invalid_bindings = deactivate_semantically_invalid_confirmed_bindings(db, product_id=prod_id, user_id=user_id)
             refreshed_bindings = refresh_confirmed_bindings_from_latest_messages(db, product_id=prod_id, user_id=user_id)
-            if removed_duplicates or deactivated_bindings or removed_discount_bindings or sanitized_bindings or invalid_bindings or refreshed_bindings:
+            if refreshed_bindings:
                 db.commit()
                 should_notify_products = True
         if should_notify_products:
@@ -4949,7 +4944,8 @@ def get_product_messages(prod_id):
     # 2. Обработка ПОДТВЕРЖДЕННЫХ
     confirmed_rows = db.execute("""
         SELECT pm.id as pm_id, pm.group_id, pm.message_id, m.chat_title, m.chat_id, m.sender_name, 
-               pm.extracted_price, pm.is_actual, m.text, m.date, pm.line_index, tc.custom_name, m.type
+               pm.extracted_price, pm.is_actual, m.text, m.date, pm.line_index, tc.custom_name, m.type,
+               m.is_blocked, m.is_delayed
         FROM product_messages pm
         JOIN messages m ON pm.message_id = m.id
         LEFT JOIN tracked_chats tc ON m.chat_id = tc.chat_id AND m.user_id = tc.user_id
@@ -5030,6 +5026,32 @@ def get_product_messages(prod_id):
                 has_updates = True
             except Exception:
                 pass
+        message_is_active = int(d.get('is_blocked') or 0) == 0 and int(d.get('is_delayed') or 0) == 0
+        line_matches_product = message_is_active and (
+            binding_row_has_explicit_line_identity(product_context, source_line)
+            or binding_product_row_matches_line(product_context, source_line, require_known_category=True)
+        )
+        if line_matches_product and int(d.get('is_actual') or 0) != 1:
+            occupied_actual = db.execute(
+                """
+                SELECT 1 FROM product_messages
+                WHERE message_id = ?
+                  AND line_index = ?
+                  AND product_id <> ?
+                  AND status = 'confirmed'
+                  AND COALESCE(is_actual, 1) = 1
+                LIMIT 1
+                """,
+                (d.get('message_id'), d.get('line_index'), prod_id),
+            ).fetchone()
+            if not occupied_actual:
+                current_id = d.get('pm_id')
+                try:
+                    db.execute("UPDATE product_messages SET is_actual = 1 WHERE id = ?", (current_id,))
+                    d['is_actual'] = 1
+                    has_updates = True
+                except Exception:
+                    pass
         identity_text = d.get('text')
         cleaned_line = strip_supplier_line_noise(source_line) or source_line.strip()
         d['match_line'] = cleaned_line
@@ -6018,6 +6040,27 @@ def refresh_confirmed_bindings_from_latest_messages(db, product_id=None, user_id
         if owner:
             user_id = owner["user_id"]
 
+    binding_filters = ["pm.status = 'confirmed'"]
+    binding_params = []
+    if product_id is not None:
+        binding_filters.append("pm.product_id = ?")
+        binding_params.append(product_id)
+    if user_id is not None:
+        binding_filters.append("p.user_id = ?")
+        binding_params.append(user_id)
+
+    rows = db.execute(f"""
+        SELECT pm.id, pm.product_id, pm.message_id, pm.line_index, pm.extracted_price, pm.is_actual,
+               m.text, m.chat_id, m.sender_name,
+               p.name, p.country, p.synonyms, p.brand, p.model_number, p.color, p.storage
+        FROM product_messages pm
+        JOIN messages m ON pm.message_id = m.id
+        JOIN products p ON pm.product_id = p.id
+        WHERE {' AND '.join(binding_filters)}
+    """, binding_params).fetchall()
+    if not rows:
+        return 0
+
     active_filters = [
         "(m.is_blocked IS NULL OR m.is_blocked = 0)",
         "(m.is_delayed IS NULL OR m.is_delayed = 0)",
@@ -6026,6 +6069,22 @@ def refresh_confirmed_bindings_from_latest_messages(db, product_id=None, user_id
     if user_id is not None:
         active_filters.append("m.user_id = ?")
         active_params.append(user_id)
+    if product_id is not None:
+        source_pairs = []
+        seen_sources = set()
+        for row in rows:
+            key = (str(row["chat_id"] or ""), str(row["sender_name"] or ""))
+            if key in seen_sources:
+                continue
+            seen_sources.add(key)
+            source_pairs.append(key)
+        if source_pairs:
+            active_filters.append("(" + " OR ".join(
+                "(COALESCE(CAST(m.chat_id AS TEXT), '') = ? AND COALESCE(m.sender_name, '') = ?)"
+                for _ in source_pairs
+            ) + ")")
+            for chat_id, sender_name in source_pairs:
+                active_params.extend([chat_id, sender_name])
 
     active_rows = db.execute(f"""
         SELECT m.id, m.text, m.date, m.chat_id, m.sender_name
@@ -6073,25 +6132,6 @@ def refresh_confirmed_bindings_from_latest_messages(db, product_id=None, user_id
     if not latest_fingerprints:
         return 0
 
-    binding_filters = ["pm.status = 'confirmed'"]
-    binding_params = []
-    if product_id is not None:
-        binding_filters.append("pm.product_id = ?")
-        binding_params.append(product_id)
-    if user_id is not None:
-        binding_filters.append("p.user_id = ?")
-        binding_params.append(user_id)
-
-    rows = db.execute(f"""
-        SELECT pm.id, pm.product_id, pm.message_id, pm.line_index, pm.extracted_price, pm.is_actual,
-               m.text, m.chat_id, m.sender_name,
-               p.name, p.country, p.synonyms, p.brand, p.model_number, p.color, p.storage
-        FROM product_messages pm
-        JOIN messages m ON pm.message_id = m.id
-        JOIN products p ON pm.product_id = p.id
-        WHERE {' AND '.join(binding_filters)}
-    """, binding_params).fetchall()
-
     changed = 0
     for row in rows:
         line = get_binding_source_line(row["text"], row["line_index"])
@@ -6109,7 +6149,10 @@ def refresh_confirmed_bindings_from_latest_messages(db, product_id=None, user_id
         if not latest:
             continue
         latest_line = latest.get("line") or line
-        if not binding_product_row_matches_line(row, latest_line, require_known_category=True):
+        if (
+            not binding_row_has_explicit_line_identity(row, latest_line)
+            and not binding_product_row_matches_line(row, latest_line, require_known_category=True)
+        ):
             if int(row["is_actual"] or 0) != 0:
                 db.execute("UPDATE product_messages SET is_actual = 0 WHERE id = ?", (row["id"],))
                 changed += 1
@@ -12084,7 +12127,7 @@ def build_compact_product_payload(db, user_id, product_row):
     return product
 
 
-def build_compact_product_payloads(db, user_id, product_rows, include_dynamic_proposed=True):
+def build_compact_product_payloads(db, user_id, product_rows, include_dynamic_proposed=True, lightweight=False):
     products = [dict(product_row) for product_row in (product_rows or [])]
     if not products:
         return []
@@ -12103,6 +12146,8 @@ def build_compact_product_payloads(db, user_id, product_rows, include_dynamic_pr
             WHERE pm.status = 'confirmed'
               AND COALESCE(pm.is_actual, 1) = 1
               AND m.user_id = ?
+              AND (m.is_blocked IS NULL OR m.is_blocked = 0)
+              AND (m.is_delayed IS NULL OR m.is_delayed = 0)
               AND pm.product_id IN ({placeholders})
             GROUP BY pm.product_id
         """, (user_id, *product_ids)).fetchall()
@@ -12142,6 +12187,37 @@ def build_compact_product_payloads(db, user_id, product_rows, include_dynamic_pr
     for product in products:
         if int(product.get('proposed_count') or 0) == 0 and int(product.get('pending_count') or 0) > 0 and int(product.get('confirmed_count') or 0) == 0:
             product['proposed_count'] = 1
+
+    if lightweight:
+        lightweight_fields = {
+            'id',
+            'name',
+            'synonyms',
+            'price',
+            'folder_id',
+            'photo_url',
+            'brand',
+            'country',
+            'weight',
+            'model_number',
+            'is_on_request',
+            'color',
+            'storage',
+            'ram',
+            'warranty',
+            'sort_index',
+            'confirmed_count',
+            'pending_count',
+            'proposed_count',
+        }
+        payloads = []
+        for product in products:
+            item = {key: product.get(key) for key in lightweight_fields if key in product}
+            photo_url = str(item.get('photo_url') or '').strip()
+            if photo_url:
+                item['photo_url'] = photo_url.split(',')[0].strip()
+            payloads.append(item)
+        return payloads
 
     return [build_compact_product_payload(db, user_id, product) for product in products]
 
@@ -12404,6 +12480,7 @@ def manage_products():
         is_compact = str(request.args.get('compact', '')).strip().lower() in {'1', 'true', 'yes'}
         connected_only = str(request.args.get('connected_only', '')).strip().lower() in {'1', 'true', 'yes'}
         include_dynamic_proposed = str(request.args.get('include_dynamic_proposed', '')).strip().lower() in {'1', 'true', 'yes'}
+        lightweight_compact = is_compact and str(request.args.get('summary', '')).strip().lower() in {'parser', 'folder_catalog', 'light'}
         raw_query = str(request.args.get('q', '') or '').strip()
         page_arg = request.args.get('page')
         limit_arg = request.args.get('limit')
@@ -12469,6 +12546,8 @@ def manage_products():
                     WHERE pm.status = 'confirmed'
                       AND COALESCE(pm.is_actual, 1) = 1
                       AND m.user_id = ?
+                      AND (m.is_blocked IS NULL OR m.is_blocked = 0)
+                      AND (m.is_delayed IS NULL OR m.is_delayed = 0)
                     GROUP BY pm.product_id
                 ) confirmed ON confirmed.product_id = p.id
                 LEFT JOIN (
@@ -12496,6 +12575,8 @@ def manage_products():
                           AND pm.status = 'confirmed'
                           AND COALESCE(pm.is_actual, 1) = 1
                           AND m.user_id = ?
+                          AND (m.is_blocked IS NULL OR m.is_blocked = 0)
+                          AND (m.is_delayed IS NULL OR m.is_delayed = 0)
                     )
                 """
                 base_params.append(user_id)
@@ -12543,7 +12624,7 @@ def manage_products():
                             """
                             rows = db.execute(brand_query, (*brand_params, limit, offset)).fetchall()
                             return jsonify({
-                                'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed),
+                                'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed, lightweight=lightweight_compact),
                                 'total': brand_total,
                                 'page': page,
                                 'limit': limit,
@@ -12584,7 +12665,7 @@ def manage_products():
                         phrase_rank_params = [f"%{normalize_product_search_text(raw_query)}%", limit, offset]
                         rows = db.execute(phrase_query, (*phrase_params, *phrase_rank_params)).fetchall()
                         return jsonify({
-                            'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed),
+                            'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed, lightweight=lightweight_compact),
                             'total': phrase_total,
                             'page': page,
                             'limit': limit,
@@ -12634,7 +12715,7 @@ def manage_products():
                         """
                         rows = db.execute(gamepad_query, (*gamepad_params, limit, offset)).fetchall()
                         return jsonify({
-                            'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed),
+                            'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed, lightweight=lightweight_compact),
                             'total': gamepad_total,
                             'page': page,
                                 'limit': limit,
@@ -12679,7 +12760,7 @@ def manage_products():
                         """
                         rows = db.execute(ps5_query, (*ps5_params, limit, offset)).fetchall()
                         return jsonify({
-                            'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed),
+                            'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed, lightweight=lightweight_compact),
                             'total': ps5_total,
                             'page': page,
                             'limit': limit,
@@ -12727,7 +12808,7 @@ def manage_products():
                             fallback_page_ids,
                         )
                         return jsonify({
-                            'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed),
+                            'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed, lightweight=lightweight_compact),
                             'total': len(fallback_ids),
                             'page': page,
                             'limit': limit,
@@ -12759,7 +12840,7 @@ def manage_products():
                     offset,
                 ]
                 rows = db.execute(query, (*search_params, *rank_params)).fetchall()
-                items = build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed)
+                items = build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed, lightweight=lightweight_compact)
                 return jsonify({
                     'items': items,
                     'total': total,
@@ -12777,7 +12858,7 @@ def manage_products():
             """
             rows = db.execute(query, (*base_params, limit, offset)).fetchall()
             return jsonify({
-                'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed),
+                'items': build_compact_product_payloads(db, user_id, rows, include_dynamic_proposed=include_dynamic_proposed, lightweight=lightweight_compact),
                 'total': total,
                 'page': page,
                 'limit': limit,
@@ -12795,7 +12876,7 @@ def manage_products():
         products = db.execute(query, tuple(base_params)).fetchall()
 
         if is_compact:
-            return jsonify(build_compact_product_payloads(db, user_id, products, include_dynamic_proposed=include_dynamic_proposed))
+            return jsonify(build_compact_product_payloads(db, user_id, products, include_dynamic_proposed=include_dynamic_proposed, lightweight=lightweight_compact))
 
         recent_message_lines = get_recent_message_lines_for_product_matching(db, user_id)
 
@@ -12952,6 +13033,8 @@ def delete_product(prod_id):
                 WHERE pm.status = 'confirmed'
                   AND COALESCE(pm.is_actual, 1) = 1
                   AND m.user_id = ?
+                  AND (m.is_blocked IS NULL OR m.is_blocked = 0)
+                  AND (m.is_delayed IS NULL OR m.is_delayed = 0)
                 GROUP BY pm.product_id
             ) confirmed ON confirmed.product_id = p.id
             LEFT JOIN (
